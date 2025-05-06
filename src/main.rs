@@ -168,6 +168,7 @@ impl Default for BackendConfig {
                 config: VsockConfig {
                     cid: 0,
                     vhost_device: PathBuf::from(VHOST_VSOCK_PATH),
+                    max_queue_sizes: None
                 },
                 label: 0,
                 mmio: None,
@@ -1424,6 +1425,7 @@ fn set_argument(cfg: &mut BackendConfig, name: &str, value: Option<&str>) -> arg
 			config: VsockConfig {
 				cid: vsock_cid,
 				vhost_device: vsock_path,
+				max_queue_sizes: None,
 			},
 			label: vsock_label,
 			mmio: None,
