@@ -14,14 +14,28 @@ prebuilt_etc {
     system_ext_specific: true,
 }
 
-rust_binary {
+soong_config_string_variable {
+    name: "fwk_supports_full_valueadds",
+    values: ["enabled", "disabled"],
+}
+
+soong_config_module_type {
+    name: "qcrosvm_rust_binary",
+    module_type: "rust_binary",
+    config_namespace: "qti_fwk_valueadds",
+    variables: ["fwk_supports_full_valueadds"],
+    properties: [
+        "enabled",
+        "defaults",
+    ],
+}
+
+qcrosvm_rust_binary {
     name: "qcrosvm",
-    defaults: ["crosvm_defaults"],
     host_supported: false,
     system_ext_specific: true,
     crate_name: "qcrosvm",
     srcs: ["src/main.rs"],
-    enabled: false,
 
     target: {
         linux_glibc: {
@@ -72,16 +86,46 @@ rust_binary {
         "libhypervisor",
         "libthiserror",
     ],
+
+    soong_config_variables: {
+        fwk_supports_full_valueadds: {
+            enabled: {
+                enabled: true,
+                defaults: ["crosvm_defaults"],
+            },
+            disabled: {
+                enabled: false,
+            },
+        },
+    },
 }
 
-rust_defaults {
+soong_config_module_type {
+    name: "qcrosvm_rust_defaults",
+    module_type: "rust_defaults",
+    config_namespace: "qti_fwk_valueadds",
+    variables: ["fwk_supports_full_valueadds"],
+    properties: ["defaults", "enabled"],
+}
+
+qcrosvm_rust_defaults {
     name: "qcrosvm_defaults",
-    defaults: ["crosvm_defaults"],
     crate_name: "qcrosvm",
     srcs: ["src/main.rs"],
     test_suites: ["general-tests"],
     auto_gen_config: true,
     edition: "2018",
+    soong_config_variables: {
+        fwk_supports_full_valueadds: {
+            enabled: {
+                enabled: true,
+                defaults: ["crosvm_defaults"],
+            },
+            disabled: {
+                enabled: false,
+            },
+        },
+    },
 }
 
 rust_test_host {
