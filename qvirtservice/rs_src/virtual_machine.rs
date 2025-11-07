@@ -198,9 +198,10 @@ impl VmInstance {
             kill(Pid::from_raw(*pid), Signal::SIGKILL)?;
         }
 
+        // This will block until the process exits, ensuring proper reaping
         if let Ok(status) = waitpid(
             Pid::from_raw(*pid),
-            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
+            None,
         ) {
             match status {
                 WaitStatus::Exited(pid, s) => {
@@ -208,6 +209,7 @@ impl VmInstance {
                         error!("PID:{pid} exit not success (0), result {s}");
                         return Err("Result {s}".into());
                     }
+                    info!("PID:{pid} exited with status: {:?}", status);
                 }
                 WaitStatus::Signaled(pid, sig, _) => {
                     info!("PID:{pid} terminated with signal: {sig}");
