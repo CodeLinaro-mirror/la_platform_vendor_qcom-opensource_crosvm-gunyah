@@ -370,7 +370,7 @@ impl IVirtualizationService for VirtualizationService {
     fn getVm(
         &self,
         vm_name: &str,
-    ) -> Result<Strong<(dyn IVirtualMachine)>, Status> {
+    ) -> Result<Strong<dyn IVirtualMachine>, Status> {
         info!(
             "getVm: Requested vm handle for {} from pid={}",
             vm_name,
