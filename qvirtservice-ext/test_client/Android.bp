@@ -1,10 +1,10 @@
 
 rust_binary {
-    name: "qvirtservice-shutdown_testclient",
+    name: "qvirtservice-ext_testclient",
     product_specific: true,
     srcs: ["test_client.rs"],
-    rustlibs: [
-        "vendor.qti.qvirt-V2-rust",
+    dylibs: [
+        "vendor.qti.qvirt-V1-rust",
         "liblogger",
         "liblog_rust",
     ],

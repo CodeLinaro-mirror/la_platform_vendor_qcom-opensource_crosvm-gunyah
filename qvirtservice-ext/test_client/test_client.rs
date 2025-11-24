@@ -6,6 +6,7 @@
 use binder::{
     BinderFeatures, DeathRecipient, IBinder, Interface, Strong,
 };
+use log::Level;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -18,7 +19,6 @@ use vendor_qti_qvirt::aidl::vendor::qti::qvirt::{
     },
     IVirtualizationService::{BpVirtualizationService, IVirtualizationService},
     VirtualMachineState::VirtualMachineState,
-    VirtualMachineClientTask::VirtualMachineClientTask,
 };
 use vendor_qti_qvirt::binder;
 
@@ -47,10 +47,7 @@ Type a VM Name
     1 -> getState
     2 -> registerCallback
     3 -> start
-    4 -> vote that VM is being used
-    5 -> unvote that work on VM is done
-    6 -> Unregister the VM connection
-    7 -> Stop
+    4 -> Stop
  */
 struct StateMachine {
     service: Strong<dyn IVirtualizationService>,
@@ -102,10 +99,7 @@ impl StateMachine {
         println!("1. getState");
         println!("2. registerCallback");
         println!("3. start");
-        println!("4. Vote on the vm");
-        println!("5. Unvote on the vm");
-        println!("6. unregister the vm");
-        println!("7. Drop vm");
+        println!("4. Drop vm");
         println!("-------------------");
         if std::io::stdin().read_line(&mut option).is_ok() {
             match option.trim().parse::<i32>() {
@@ -141,27 +135,6 @@ impl StateMachine {
                     }
                 }
                 Ok(4) => {
-                    if self.vm.as_ref().unwrap().performtask_client(VirtualMachineClientTask::VOTE).is_ok() {
-                        println!("Voted on the VM");
-                    } else {
-                        println!("Failed to Vote on the VM");
-                    }
-                }
-                Ok(5) => {
-                    if self.vm.as_ref().unwrap().performtask_client(VirtualMachineClientTask::UNVOTE).is_ok() {
-                        println!("Un-Voted on the VM");
-                    } else {
-                        println!("Failed to Un-Vote on the VM");
-                    }
-                }
-                Ok(6) => {
-                    if self.vm.as_ref().unwrap().unregister().is_ok() {
-                        println!("Unregistered the client on the VM");
-                    } else {
-                        println!("Failed to Unregister with the VM");
-                    }
-                }
-                Ok(7) => {
                     println!("Dropping VM");
                     self.vm = None;
                     self.name = None;
@@ -190,6 +163,7 @@ fn main() {
     let _init_success = logger::init(
         logger::Config::default()
             .with_tag_on_device("qvirtservice_client")
+            .with_min_level(Level::Debug),
     );
 
     loop {

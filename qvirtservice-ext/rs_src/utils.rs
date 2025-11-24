@@ -14,7 +14,7 @@ impl UEvent {
         passcred: bool,
     ) -> Result<RawFd, Box<dyn Error>> {
         let fd = unsafe {
-            uevent_shutdown_bindgen::uevent_open_socket(buf_sz as i32, passcred)
+            uevent_ext_bindgen::uevent_open_socket(buf_sz as i32, passcred)
         };
         if fd < 0 {
             return Err("Error: {fd}".into());
@@ -29,7 +29,7 @@ impl UEvent {
     ) -> Result<usize, Box<dyn Error>> {
         *buffer = vec![0u8; length];
         let result = unsafe {
-            uevent_shutdown_bindgen::uevent_kernel_multicast_recv(
+            uevent_ext_bindgen::uevent_kernel_multicast_recv(
                 socket,
                 buffer.as_mut_ptr() as *mut libc::c_void,
                 length,
