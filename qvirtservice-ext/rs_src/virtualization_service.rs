@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: BSD-3-Clause-Clear
 */
 
-use crate::virtual_machine::{VirtualMachine, VmInstance, VmParameters};
+use crate::virtual_machine::{VirtualMachine, VmInstance, VmParameters, UeventInfo};
 
 use crate::utils::UEvent;
 
@@ -166,7 +166,7 @@ impl VirtualizationService {
         return service;
     }
 
-    fn parse_event(msg: Vec<u8>) -> Option<(String, String)> {
+    fn parse_event(msg: Vec<u8>) -> Option<UeventInfo> {
         if let Ok(msg) = String::from_utf8(msg) {
             let mut pairs: Vec<&str> =
                 msg.trim_matches('\0').split('\0').collect();
@@ -174,17 +174,21 @@ impl VirtualizationService {
 
             let mut event = None;
             let mut vm_name = None;
+            let mut event_reason = None;
             for pair in pairs {
                 let p: Vec<&str> = pair.splitn(2, "=").collect();
                 match p[0] {
                     "EVENT" => event = Some(p[1].to_string()),
                     "vm_name" => vm_name = Some(p[1].to_string()),
+                    "vm_exit" => event_reason = Some(p[1].to_string()),
                     _ => continue,
                 };
             }
-            if let (Some(e), Some(n)) = (event, vm_name) {
-                return Some((e, n));
+            let uevent_info = UeventInfo::new(vm_name.clone().unwrap_or_else(|| String::new()),event.clone().unwrap_or_else(|| String::new()),event_reason.clone().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0));
+            if !uevent_info.event.is_empty() {
+                info!("These are the uevent_info parameter VM Name: {}, \n \t\t UEVENT Received: {}, \n \t\t Uevent Reason: {}", uevent_info.vm_name, uevent_info.event, uevent_info.event_reason.to_string());
             }
+            return Some(uevent_info);
         }
         return None;
     }
@@ -198,15 +202,17 @@ impl VirtualizationService {
             UEvent::uevent_kernel_multicast_recv(uevent_fd, &mut msg, 1024)
         {
             if let Some(event) = Self::parse_event(msg.clone()) {
-                match vm_instance_map.get(&event.1) {
+                match vm_instance_map.get(&event.vm_name) {
                     Some(wrpr) => {
                         if let Ok(mut instance) = wrpr.instance.lock() {
-                            debug!("Initiating request to notify state change to {} clients", event.1);
-                            instance.notify_clients(&event.0);
+                            debug!("Initiating request to notify state change to {} clients", &event.vm_name);
+                            instance.notify_clients(&event.event, &event.event_reason.to_string());
                         }
                     }
                     None => {
-                        error!("Invalid vm_name received from uevent");
+                        if !event.vm_name.is_empty() {
+                            error!("Invalid vm_name received from uevent");
+                        }
                     }
                 }
             }

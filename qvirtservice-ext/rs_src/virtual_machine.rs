@@ -105,6 +105,13 @@ pub struct VmParameters {
     pub on_demand_start_supported: bool,
 }
 
+#[derive(Default, Debug, Clone)]
+pub struct UeventInfo {
+    pub vm_name: String,
+    pub event: String,
+    pub event_reason: u32,
+}
+
 #[derive(Default)]
 pub struct VmInstance {
     pub vm_state: VirtualMachineState,
@@ -118,7 +125,19 @@ pub struct VmInstance {
     // Upon client death, remove their callback.
     pub death_id: AtomicUsize,
     pub death_recipients: HashMap<usize, DeathRecipient>,
+    pub uevent_info: UeventInfo,
 }
+
+impl UeventInfo{
+    pub fn new(vmname: String, event: String, event_reason: u32) -> Self {
+        UeventInfo {
+            vm_name: vmname,
+            event: event,
+            event_reason: event_reason,
+        }
+    }
+}
+
 impl VmInstance {
     pub fn new(vm_parameters: VmParameters) -> Self {
         let inst = Self {
@@ -128,12 +147,15 @@ impl VmInstance {
             virtual_machine_callbacks: Vec::new(),
             death_id: AtomicUsize::new(0),
             death_recipients: HashMap::new(),
+            uevent_info : UeventInfo::new(String::new(),String::new(),0),
         };
         inst.set_vm_status_property("NOT_STARTED");
         return inst;
     }
 
-    pub fn notify_clients(&mut self, event: &str) -> () {
+    pub fn notify_clients(&mut self, event: &str, event_reason: &str) -> () {
+        let reason:u32 = event_reason.parse::<u32>().unwrap_or(0);
+        let mut reason_string:String = String::new();
         if event == "create" {
             info!(
                 "Event=create received for {}, state change to RUNNING",
@@ -148,6 +170,15 @@ impl VmInstance {
             );
             self.vm_state = VirtualMachineState::STOPPED;
             self.set_vm_status_property("STOPPED");
+            if reason > 3 {
+                info!(
+                    "Event=destroy received for {}, state change to CRASHED",
+                    self.vm_parameters.name
+                );
+                reason_string = format!("VM crashed and setting VM to crashed state");
+                self.vm_state = VirtualMachineState::VM_CRASHED;
+                self.set_vm_status_property("VM_CRASHED");
+            }
         }
 
         // notify_clients
@@ -159,9 +190,10 @@ impl VmInstance {
             return;
         }
         info!(
-            "Notifying {} clients of {}",
+            "Notifying {} clients of {} the reason for VM {}",
             self.virtual_machine_callbacks.len(),
-            self.vm_parameters.name
+            self.vm_parameters.name,
+            reason_string
         );
 
         for callback in &self.virtual_machine_callbacks {
