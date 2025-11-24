@@ -44,10 +44,10 @@ use vendor_qti_qvirt::binder::{
 // ======================================================================
 
 static VM_BINARY_FILE: &str = "/system_ext/bin/qcrosvm";
-static DEFAULT_BOOT_COMPLETE_TIMEOUT: u16 = 60;
+static DEFAULT_FS_DEPENDENCY_TIMEOUT: u16 = 60;
 
-fn boot_complete_timeout_default() -> u16 {
-    DEFAULT_BOOT_COMPLETE_TIMEOUT
+fn fs_dependency_timeout_default() -> u16 {
+    DEFAULT_FS_DEPENDENCY_TIMEOUT
 }
 
 fn default_vmssr_true() -> bool {
@@ -101,9 +101,11 @@ pub struct VmParameters {
     #[serde(default)]
     pub try_count: u8,
     pub boot_wait_time: u8,
-    #[serde(default = "boot_complete_timeout_default")]
-    pub boot_complete_timeout: u16,
+    #[serde(default = "fs_dependency_timeout_default")]
+    pub fs_dependency_timeout: u16,
     pub no_fs_dependency: bool,
+    #[serde(default)]
+    pub fs_dependency_prop: Option<String>,
     pub autostart: bool,
     #[serde(default)]
     pub on_demand_start_supported: bool,

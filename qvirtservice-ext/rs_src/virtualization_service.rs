@@ -39,7 +39,6 @@ use vendor_qti_qvirt::binder::{
 };
 
 static VENDOR_CONFIG_FILE: &str = "/vendor/etc/qvirtmgr-vndr.json";
-static BOOT_COMPLETE_PROP: &str = "sys.boot_completed";
 
 pub struct VmInstanceWrapper {
     // VmInstance
@@ -47,8 +46,14 @@ pub struct VmInstanceWrapper {
     // - Mutex -> Needs to be mutable anywhere (autostart_complete, etc.)
     instance: Arc<Mutex<VmInstance>>,
     enabled: bool,
-    boot_complete_timeout: u16,
+    fs_dependency_timeout: u16,
 }
+
+pub struct FsDependency {
+    no_fs_dependency: bool,
+    fs_dependency_prop: String,
+}
+
 //                          < name , VmInstanceWrapper>
 type VmInstanceMap = HashMap<String, VmInstanceWrapper>;
 
@@ -74,25 +79,28 @@ impl VirtualizationService {
         // Store the vm's thread handle for the no_fs_dependent ones.
         let mut no_fs_dependent_handles = Vec::new();
 
-        // Store autostart vms
-        let mut autostart_vms = Vec::<(String, bool)>::new();
+        let mut autostart_vms = Vec::<(String, FsDependency)>::new();
 
         // Parse the config file
         if let Ok(vm_parameters_list) = Self::parse_vm_config_file() {
-            info!("Parsing VM Config File Success.");
+
 
             for vm_param in vm_parameters_list {
                 // Save data now for easy access (before locked in mutex).
                 let name = vm_param.name.clone();
                 let enabled = vm_param.enable.clone();
-                let boot_complete_timeout =
-                    vm_param.boot_complete_timeout.clone();
+                let no_fs_dependency = vm_param.no_fs_dependency.clone();
+                let fs_dependency_timeout = vm_param.fs_dependency_timeout.clone();
+                let fs_dependency_prop = vm_param.fs_dependency_prop.clone().unwrap_or_default();
 
                 // Save autostart vms for easy access.
                 if vm_param.autostart && vm_param.enable {
                     autostart_vms.push((
                         name.clone(),
-                        vm_param.no_fs_dependency.clone(),
+                        FsDependency {
+                            no_fs_dependency: no_fs_dependency,
+                            fs_dependency_prop: fs_dependency_prop,
+                        },
                     ));
                 }
 
@@ -101,7 +109,7 @@ impl VirtualizationService {
                 let wrpr = VmInstanceWrapper {
                     instance: Arc::new(Mutex::new(VmInstance::new(vm_param))),
                     enabled: enabled,
-                    boot_complete_timeout: boot_complete_timeout,
+                    fs_dependency_timeout: fs_dependency_timeout,
                 };
 
                 vm_instance_map.insert(name, wrpr); // Put a ref count in the map
@@ -123,38 +131,51 @@ impl VirtualizationService {
         });
 
         // Launch autostart VMs
-        for (name, no_fs_dependency) in autostart_vms {
-            let wrapper = service.vm_instance_map.get(&name).unwrap();
-            let timeout_for_thread = wrapper.boot_complete_timeout.clone();
-            let instance_for_thread = wrapper.instance.clone();
-            if no_fs_dependency {
-                let handle = thread::spawn(move || {
-                    if let Ok(mut vm) = instance_for_thread.lock() {
-                        vm.launch_autostart_vm();
-                    }
-                });
-                no_fs_dependent_handles.push(handle);
-            } else {
-                // Wait for timeout if fs dependent
-                thread::spawn(move || {
-                    let mut watcher = system_properties::PropertyWatcher::new(BOOT_COMPLETE_PROP).unwrap();
-                    if let Ok(_) = watcher.wait_for_value(
-                        "1",
-                        Some(Duration::new(timeout_for_thread.into(), 0)),
-                    ) {
-                        debug!("System boot completed.");
-                        // Only aquire lock after wait for boot complete.
-                        // Allows clients to register cbs during the wait.
+        for (name, fs_dep) in &autostart_vms {
+            if let Some(wrapper) = service.vm_instance_map.get(name.as_str()) {
+                let timeout_for_thread = wrapper.fs_dependency_timeout.clone();
+                let instance_for_thread = wrapper.instance.clone();
+                if fs_dep.no_fs_dependency {
+                    let handle = thread::spawn(move || {
                         if let Ok(mut vm) = instance_for_thread.lock() {
                             vm.launch_autostart_vm();
                         }
-                    } else {
-                        error!("Timed out checking for sys.boot_completed.");
-                        if let Ok(mut vm) = instance_for_thread.lock() {
-                            vm.autostart_done = true;
+                    });
+                    no_fs_dependent_handles.push(handle);
+                } else {
+                    let fs_dep_prop = fs_dep.fs_dependency_prop.clone();
+                    //Wait for timeout if fs dependent
+                    thread::spawn(move || {
+                        let mut watcher = match system_properties::PropertyWatcher::new(&fs_dep_prop) {
+                            Ok(w) => w,
+                            Err(e) => {
+                                error!("Failed to create property watcher for {}: {}", fs_dep_prop, e);
+                                if let Ok(mut vm) = instance_for_thread.lock() {
+                                    vm.autostart_done = true;
+                                }
+                                return;
+                            }
+                        };
+                        if let Ok(_) = watcher.wait_for_value(
+                            "1",
+                            Some(Duration::new(timeout_for_thread.into(), 0)),
+                        ) {
+                            debug!("Fs Dependency satisfied");
+                            // Only aquire lock after wait for boot complete.
+                            // Allows clients to register cbs during the wait.
+                            if let Ok(mut vm) = instance_for_thread.lock() {
+                                vm.launch_autostart_vm();
+                            }
+                        } else {
+                            error!("Timed out checking for {}.", fs_dep_prop);
+                            if let Ok(mut vm) = instance_for_thread.lock() {
+                                vm.autostart_done = true;
+                            }
                         }
-                    }
-                });
+                    });
+                }
+            } else {
+                error!("VM '{}' not found in instance map, skipping autostart", name);
             }
         }
 
@@ -221,20 +242,27 @@ impl VirtualizationService {
 
     fn uevent_listener(vm_instance_map: Arc<VmInstanceMap>) -> () {
         info!("started uevent listener thread");
-        let uevent_fd = UEvent::uevent_open_socket(64 * 1024, true).unwrap();
-        fcntl(uevent_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
-
+        let uevent_fd = match UEvent::uevent_open_socket(64 * 1024, true) {
+            Ok(fd) => fd,
+            Err(e) => {
+                error!("Failed to open uevent socket: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = fcntl(uevent_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)) {
+            error!("Failed to set socket to non-blocking mode: {}", e);
+            return;
+        }
         loop {
             let mut ufd = [PollFd::new(uevent_fd, PollFlags::POLLIN)];
             if let Ok(nr) = poll(&mut ufd, -1) {
                 if nr < 0 {
                     continue;
                 }
-                if ufd[0].revents().unwrap().contains(PollFlags::POLLIN) {
-                    Self::handle_uevent_event(
-                        uevent_fd.clone(),
-                        &vm_instance_map,
-                    );
+                if let Some(revents) = ufd[0].revents() {
+                    if revents.contains(PollFlags::POLLIN) {
+                        Self::handle_uevent_event(uevent_fd, &vm_instance_map);
+                    }
                 }
             }
         }
