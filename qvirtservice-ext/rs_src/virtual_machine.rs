@@ -50,6 +50,10 @@ fn boot_complete_timeout_default() -> u16 {
     DEFAULT_BOOT_COMPLETE_TIMEOUT
 }
 
+fn default_vmssr_true() -> bool {
+    false
+}
+
 #[derive(Default, Debug, PartialEq, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlState {
@@ -103,6 +107,8 @@ pub struct VmParameters {
     pub autostart: bool,
     #[serde(default)]
     pub on_demand_start_supported: bool,
+    #[serde(default = "default_vmssr_true")]
+    pub vm_ssr_enable: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -541,11 +547,17 @@ impl IVirtualMachine for VirtualMachine {
             }
 
             // Check for unsupported restart request
-            if instance.vm_state == VirtualMachineState::STOPPED {
-                error!("Request received from pid={} to start a Vm which is in stopped state, rejecting it.",
-                        ThreadState::get_calling_pid());
-                return Err(Status::new_service_specific_error_str(ERROR_VM_START,
-                        Some("Cannot start a Vm which is in STOPPED state.")));
+            if !instance.vm_parameters.vm_ssr_enable {
+                if instance.vm_state == VirtualMachineState::VM_CRASHED || instance.vm_state == VirtualMachineState::STOPPED {
+                    error!(
+                        "Request received from pid={} to start a Vm which is in STOPPED/CRASHED state, rejecting it.",
+                        ThreadState::get_calling_pid()
+                    );
+                    return Err(Status::new_service_specific_error_str(
+                        ERROR_VM_START,
+                        Some("Cannot start a Vm which is in STOPPED/CRASHED state.")
+                    ));
+                }
             }
 
             // Launch it!
