@@ -91,7 +91,7 @@ impl VirtualizationService {
                 let enabled = vm_param.enable.clone();
                 let no_fs_dependency = vm_param.no_fs_dependency.clone();
                 let fs_dependency_timeout = vm_param.fs_dependency_timeout.clone();
-                let fs_dependency_prop = vm_param.fs_dependency_prop.clone().unwrap_or_default();
+                let fs_dependency_prop = vm_param.fs_dependency_prop.clone();
 
                 // Save autostart vms for easy access.
                 if vm_param.autostart && vm_param.enable {
