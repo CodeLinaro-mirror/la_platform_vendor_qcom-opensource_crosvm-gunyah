@@ -1,7 +1,8 @@
+
 rust_bindgen {
-    name: "libuevent_shutdown_bindgen",
+    name: "libuevent_ext_bindgen",
     wrapper_src: "rs_src/bindgen/uevent.h",
-    crate_name: "uevent_shutdown_bindgen",
+    crate_name: "uevent_ext_bindgen",
     source_stem: "bindings",
     header_libs: ["libcutils_headers"],
     bindgen_flags: [
@@ -12,14 +13,14 @@ rust_bindgen {
 }
 
 rust_binary {
-    name: "vendor.qti.qvirt-service-shutdown_rs",
+    name: "vendor.qti.qvirt-service-ext_rs",
     product_specific: true,
     srcs: [
         "rs_src/main.rs",
     ],
     vintf_fragments: ["vendor.qti.qvirt-service.xml"],
-    init_rc: ["vendor.qti.qvirt-service-shutdown_rs.rc"],
-    rustlibs: [
+    init_rc: ["vendor.qti.qvirt-service-ext_rs.rc"],
+    dylibs: [
         "liblogger",
         "liblog_rust",
         "libbinder_rs",
@@ -29,10 +30,9 @@ rust_binary {
         "liblibc",
         "librustutils",
         "vendor.qti.qvirt-V2-rust",
-        "vendor.qti.qvirtvendor-V1-rust",
     ],
     rlibs: [
-        "libuevent_shutdown_bindgen",
+        "libuevent_ext_bindgen",
     ],
     shared_libs: [
         "libcutils",

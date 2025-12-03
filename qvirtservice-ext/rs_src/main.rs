@@ -9,15 +9,23 @@ mod virtualization_service;
 
 use crate::virtualization_service::VirtualizationService;
 use log::Level;
+use std::env;
 
 fn main() {
     binder::ProcessState::set_thread_pool_max_thread_count(12);
     binder::ProcessState::start_thread_pool();
 
+    let args: Vec<String> = env::args().collect();
+    let log_level = if args.get(1) == Some(&"-v".to_string()) {
+        Level::Debug
+    } else {
+        Level::Info
+    };
+
     let _init_success = logger::init(
         logger::Config::default()
-            .with_tag_on_device("qvirtservice-shutdown_rs")
-            .with_min_level(Level::Error)
+            .with_tag_on_device("qvirtservice-ext_rs")
+            .with_min_level(log_level),
     );
 
     let virt_service = VirtualizationService::virtualization_service();

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: BSD-3-Clause-Clear
 */
 
-use crate::virtual_machine::{VirtualMachine, VmInstance, VmParameters, UeventInfo};
+use crate::virtual_machine::{VirtualMachine, VmInstance, VmParameters};
 
 use crate::utils::UEvent;
 
@@ -11,7 +11,7 @@ use rustutils::system_properties;
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::{
     collections::HashMap,
     error::Error,
@@ -27,8 +27,6 @@ use log::{debug, error, info};
 
 use serde_json::Value;
 
-use std::os::fd::{BorrowedFd};
-
 use vendor_qti_qvirt::aidl::vendor::qti::qvirt::{
     IVirtualMachine::IVirtualMachine,
     IVirtualizationService::{
@@ -40,8 +38,6 @@ use vendor_qti_qvirt::binder::{
     BinderFeatures, ExceptionCode, Interface, Status, Strong, ThreadState,
 };
 
-//use vendor_qti_qvirtvendor::aidl::vendor::qti::qvirtvendor::IVendorVM::IVendorVM;
-
 static VENDOR_CONFIG_FILE: &str = "/vendor/etc/qvirtmgr-vndr.json";
 static BOOT_COMPLETE_PROP: &str = "sys.boot_completed";
 
@@ -52,10 +48,7 @@ pub struct VmInstanceWrapper {
     instance: Arc<Mutex<VmInstance>>,
     enabled: bool,
     boot_complete_timeout: u16,
-    enabled_socs: Vec<String>,
-    current_soc: String,
 }
-
 //                          < name , VmInstanceWrapper>
 type VmInstanceMap = HashMap<String, VmInstanceWrapper>;
 
@@ -94,21 +87,9 @@ impl VirtualizationService {
                 let enabled = vm_param.enable.clone();
                 let boot_complete_timeout =
                     vm_param.boot_complete_timeout.clone();
-                let enabled_socs = vm_param.enabled_socs.clone();
-                let mut current_soc = String::new();
-                if !(enabled_socs.is_empty()) {
-                    if let Ok(Some(value)) = system_properties::read("ro.boot.product.vendor.sku") {
-                        debug!("Current sku value is {}",value);
-                        current_soc = value.clone();
-                        if (vm_param.autostart) && enabled_socs.contains(&value) {
-                            autostart_vms.push((
-                                name.clone(),
-                                vm_param.no_fs_dependency.clone(),
-                            ));
-                        }
-                    }
-                }
-                else if vm_param.autostart && vm_param.enable {
+
+                // Save autostart vms for easy access.
+                if vm_param.autostart && vm_param.enable {
                     autostart_vms.push((
                         name.clone(),
                         vm_param.no_fs_dependency.clone(),
@@ -121,8 +102,6 @@ impl VirtualizationService {
                     instance: Arc::new(Mutex::new(VmInstance::new(vm_param))),
                     enabled: enabled,
                     boot_complete_timeout: boot_complete_timeout,
-                    enabled_socs: enabled_socs,
-                    current_soc: current_soc,
                 };
 
                 vm_instance_map.insert(name, wrpr); // Put a ref count in the map
@@ -150,43 +129,14 @@ impl VirtualizationService {
             let instance_for_thread = wrapper.instance.clone();
             if no_fs_dependency {
                 let handle = thread::spawn(move || {
-                    let mut vm_ssr_enablecheck:bool = false;
-                    let mut vm_autostart_done:bool = false;
                     if let Ok(mut vm) = instance_for_thread.lock() {
                         vm.launch_autostart_vm();
-                        vm_ssr_enablecheck = vm.vm_parameters.vm_ssr_enable;
-                        vm_autostart_done = vm.autostart_done;
-                        drop(vm);
-                    }
-                    if vm_ssr_enablecheck && vm_autostart_done{
-                        if let Ok(mut vm) = instance_for_thread.lock() {
-                            match vm.autostart_connectvm() {
-                                Ok(0)=>{
-                                    info!("VM userpspace connection is successful");
-                                },
-                                Ok(_)=>{
-                                    info!("VM userspace connection is not successful, Will be placed in crashed state");
-                                },
-                                Err(response) => {
-                                    error!(
-                                        "VM: {} has been removed: {response}",
-                                        vm.vm_parameters.name
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    if vm_ssr_enablecheck && vm_autostart_done {
-                        let vm_instance = instance_for_thread.clone();
-                        info!("Auto Shutdown Thread has been initiated");
-                        VmInstance::auto_shutdown_thread_handle_initiator(vm_instance);
                     }
                 });
                 no_fs_dependent_handles.push(handle);
             } else {
                 // Wait for timeout if fs dependent
                 thread::spawn(move || {
-                    let mut vm_ssr_enablecheck:bool = false;
                     let mut watcher = system_properties::PropertyWatcher::new(BOOT_COMPLETE_PROP).unwrap();
                     if let Ok(_) = watcher.wait_for_value(
                         "1",
@@ -197,35 +147,6 @@ impl VirtualizationService {
                         // Allows clients to register cbs during the wait.
                         if let Ok(mut vm) = instance_for_thread.lock() {
                             vm.launch_autostart_vm();
-                            vm_ssr_enablecheck = vm.vm_parameters.vm_ssr_enable;
-                            drop(vm);
-                        }
-                        if vm_ssr_enablecheck{
-                          if let Ok(mut vm) = instance_for_thread.lock() {
-                                match vm.autostart_connectvm() {
-                                    Ok(-1)=>{
-                                        info!("VM userspace connect is not supported");
-                                    },
-                                    Ok(0)=>{
-                                        info!("VM userpspace connection is successful");
-                                    },
-                                    Ok(_)=>{
-                                        info!("VM userspace connection is not successful, Will be placed in crashed state");
-                                    },
-                                    Err(response) => {
-                                        error!(
-                                            "Client: {} has been removed: {response}",
-                                            vm.vm_parameters.name
-                                        );
-                                    }
-                                }
-                            drop(vm);
-                            }
-                        }
-                        if vm_ssr_enablecheck {
-                            let vm_instance = instance_for_thread.clone();
-                            info!("Auto Shutdown Thread has been initiated");
-                            VmInstance::auto_shutdown_thread_handle_initiator(vm_instance);
                         }
                     } else {
                         error!("Timed out checking for sys.boot_completed.");
@@ -245,7 +166,7 @@ impl VirtualizationService {
         return service;
     }
 
-    fn parse_event(msg: Vec<u8>) -> Option<UeventInfo> {
+    fn parse_event(msg: Vec<u8>) -> Option<(String, String)> {
         if let Ok(msg) = String::from_utf8(msg) {
             let mut pairs: Vec<&str> =
                 msg.trim_matches('\0').split('\0').collect();
@@ -253,21 +174,17 @@ impl VirtualizationService {
 
             let mut event = None;
             let mut vm_name = None;
-            let mut event_reason = None;
             for pair in pairs {
                 let p: Vec<&str> = pair.splitn(2, "=").collect();
                 match p[0] {
                     "EVENT" => event = Some(p[1].to_string()),
                     "vm_name" => vm_name = Some(p[1].to_string()),
-                    "vm_exit" => event_reason = Some(p[1].to_string()),
                     _ => continue,
                 };
             }
-            let uevent_info = UeventInfo::new(vm_name.clone().unwrap_or_else(|| String::new()),event.clone().unwrap_or_else(|| String::new()),event_reason.clone().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0));
-            if !uevent_info.event.is_empty() {
-                info!("These are the uevent_info parameter VM Name: {}, \n \t\t UEVENT Received: {}, \n \t\t Uevent Reason: {}", uevent_info.vm_name, uevent_info.event, uevent_info.event_reason.to_string());
+            if let (Some(e), Some(n)) = (event, vm_name) {
+                return Some((e, n));
             }
-            return Some(uevent_info);
         }
         return None;
     }
@@ -281,17 +198,15 @@ impl VirtualizationService {
             UEvent::uevent_kernel_multicast_recv(uevent_fd, &mut msg, 1024)
         {
             if let Some(event) = Self::parse_event(msg.clone()) {
-                match vm_instance_map.get(&event.vm_name) {
+                match vm_instance_map.get(&event.1) {
                     Some(wrpr) => {
                         if let Ok(mut instance) = wrpr.instance.lock() {
-                            debug!("Initiating request to notify state change to {} clients", &event.vm_name);
-                            instance.notify_clients(&event.event, &event.event_reason.to_string());
+                            debug!("Initiating request to notify state change to {} clients", event.1);
+                            instance.notify_clients(&event.0);
                         }
                     }
                     None => {
-                        if !event.vm_name.is_empty() {
-                            debug!("Invalid vm_name received from uevent");
-                        }
+                        error!("Invalid vm_name received from uevent");
                     }
                 }
             }
@@ -302,11 +217,10 @@ impl VirtualizationService {
         info!("started uevent listener thread");
         let uevent_fd = UEvent::uevent_open_socket(64 * 1024, true).unwrap();
         fcntl(uevent_fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
-        let borrowed_uevent_fd = unsafe { BorrowedFd::borrow_raw(uevent_fd) };
 
         loop {
-            let mut ufd = [PollFd::new(borrowed_uevent_fd.as_raw_fd(), PollFlags::POLLIN)];
-            if let Ok(nr) = poll(&mut ufd,  -1) {
+            let mut ufd = [PollFd::new(uevent_fd, PollFlags::POLLIN)];
+            if let Ok(nr) = poll(&mut ufd, -1) {
                 if nr < 0 {
                     continue;
                 }
@@ -326,25 +240,13 @@ impl VirtualizationService {
 
         // Uses serde_json to deserialize directly into strongly typed VmParameters object.
         let vendor_config_file = File::open(VENDOR_CONFIG_FILE)?;
-        let root: Value = match serde_json::from_reader(vendor_config_file){
-            Ok(parsed) => parsed,
-            Err(e) => {
-                    error!("Parsing of JSON file is incorrect : {}",e);
-                    return Err(format!("Error parsing JSON: {}",e).into());
-                }
-        };
+        let root: Value = serde_json::from_reader(vendor_config_file).unwrap();
         let json_config_array: &Vec<Value> = root
             .get("qvirtmgr")
             .and_then(|mgr| mgr.get("vm_config"))
             .and_then(|arr| arr.as_array())
             .ok_or("VM Configuration is invalid.")?;
         for config in json_config_array {
-            let enable_present = config.get("enable").is_some();
-            let enabled_socs_present = config.get("enabled_socs").is_some();
-            if enable_present && enabled_socs_present {
-                error!("Error: Only one of the predefined keys ('enable', 'enabled_socs') is allowed in config");
-                return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Multiple keys('enable', 'enabled_socs') found")));
-            }
             match serde_json::from_value::<VmParameters>(config.to_owned()) {
                 Ok(vm_param) => {
                     vm_parameters_list.push(vm_param);
@@ -378,19 +280,7 @@ impl IVirtualizationService for VirtualizationService {
         );
 
         if let Some(instance_wrpr) = self.vm_instance_map.get(vm_name) {
-            if !instance_wrpr.enabled_socs.is_empty() {
-                let targets = instance_wrpr.enabled_socs.clone();
-                let current_soc = &instance_wrpr.current_soc;
-                debug!("Current sku value is {}", current_soc);
-                if !targets.contains(current_soc) {
-                    error!("getVm: {vm_name} is not enabled on this target, rejecting request.");
-                    return Err(Status::new_exception_str(
-                        ExceptionCode::UNSUPPORTED_OPERATION,
-                        Some("vm not enabled on this target"),
-                    ));
-                }
-            }
-            else if !instance_wrpr.enabled {
+            if !instance_wrpr.enabled {
                 error!("getVm: enable bit is false for {vm_name}, rejecting request.");
                 return Err(Status::new_exception_str(
                     ExceptionCode::UNSUPPORTED_OPERATION,
@@ -400,7 +290,6 @@ impl IVirtualizationService for VirtualizationService {
             // Create a VirtualMachine which wraps the Arc<Mutex<VmInstance>>
             let virtual_machine = VirtualMachine {
                 vm_instance: instance_wrpr.instance.to_owned(),
-                current_soc: instance_wrpr.current_soc.clone(),
             }; // Increments ref count of instance_obj
             return Ok(virtual_machine.to_binder());
         } else {
