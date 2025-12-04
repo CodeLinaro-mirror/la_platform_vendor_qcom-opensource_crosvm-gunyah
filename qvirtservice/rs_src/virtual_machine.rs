@@ -25,7 +25,7 @@ use nix::{
     unistd::ForkResult, unistd::Pid, unistd::setsid, sys::wait::wait,
 };
 
-use rustutils::system_properties;
+use rustutils::android::system_properties;
 
 use log::{debug, error, info};
 

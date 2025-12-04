@@ -7,7 +7,7 @@ use crate::virtual_machine::{VirtualMachine, VmInstance, VmParameters, UeventInf
 
 use crate::utils::UEvent;
 
-use rustutils::system_properties;
+use rustutils::android::system_properties;
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
