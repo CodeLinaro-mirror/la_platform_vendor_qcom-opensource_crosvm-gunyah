@@ -53,11 +53,6 @@ qcrosvm_rust_binary {
             enabled: false,
         },
     },
-    arch: {
-        arm64: {
-            rustlibs: ["libaarch64"],
-        },
-    },
 
     edition: "2018",
     features: [
@@ -72,20 +67,32 @@ qcrosvm_rust_binary {
         "-Wl,--rpath,\\$$ORIGIN/../../lib64",
     ],
 
-    rustlibs: [
-        "libbase_rust",
-        "libdevices",
-        "libdisk",
-        "liblibc",
-        "libvm_memory",
-        "libsync_rust",
-        "libandroid_logger",
-        "liblog_rust",
-        "libminijail_rust",
-        "libsimplelog",
-        "libhypervisor",
-        "libthiserror",
-    ],
+rustlibs: [
+      "libbase_rust",
+      "libdevices",
+      "libdisk",
+      "liblibc",
+      "libvm_memory",
+      "libsync_rust",
+      "libandroid_logger",
+      "liblog_rust",
+      "libminijail_rust",
+      "libsimplelog",
+      "libhypervisor",
+      "libthiserror",
+   ],
+
+
+arch: {
+   arm: {
+      enabled: false,
+     },
+   arm64: {
+       rustlibs: [
+            "libaarch64",
+         ],
+     },
+ },
 
     soong_config_variables: {
         fwk_supports_full_valueadds: {
