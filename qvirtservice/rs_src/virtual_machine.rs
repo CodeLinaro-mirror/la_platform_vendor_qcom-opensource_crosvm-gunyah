@@ -49,6 +49,10 @@ fn fs_dependency_timeout_default() -> u16 {
     DEFAULT_FS_DEPENDENCY_TIMEOUT
 }
 
+fn fs_dependency_prop_default() -> String {
+    "sys.boot_completed".to_string()
+}
+
 #[derive(Default, Debug, PartialEq, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlState {
@@ -99,8 +103,8 @@ pub struct VmParameters {
     #[serde(default = "fs_dependency_timeout_default")]
     pub fs_dependency_timeout: u16,
     pub no_fs_dependency: bool,
-    #[serde(default)]
-    pub fs_dependency_prop: Option<String>,
+    #[serde(default = "fs_dependency_prop_default")]
+    pub fs_dependency_prop: String,
     pub autostart: bool,
     #[serde(default)]
     pub on_demand_start_supported: bool,

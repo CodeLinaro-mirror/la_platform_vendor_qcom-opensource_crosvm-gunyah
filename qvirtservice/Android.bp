@@ -40,7 +40,7 @@ rust_binary {
     ],
     vintf_fragments: ["vendor.qti.qvirt-service.xml"],
     init_rc: ["vendor.qti.qvirt-service_rs.rc"],
-    dylibs: [
+    rustlibs: [
         "liblogger",
         "liblog_rust",
         "libbinder_rs",
