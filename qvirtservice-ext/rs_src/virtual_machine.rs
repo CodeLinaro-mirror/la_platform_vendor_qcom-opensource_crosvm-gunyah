@@ -32,6 +32,7 @@ use vendor_qti_qvirt::aidl::vendor::qti::qvirt::{
     IVirtualMachine::{BnVirtualMachine, IVirtualMachine, ERROR_VM_START},
     IVirtualMachineCallback::IVirtualMachineCallback,
     VirtualMachineState::VirtualMachineState,
+    VirtualMachineClientTask::VirtualMachineClientTask,
 };
 use vendor_qti_qvirt::binder::{
     BinderFeatures, DeathRecipient, ExceptionCode, IBinder, Interface, Status,
@@ -47,6 +48,10 @@ static DEFAULT_FS_DEPENDENCY_TIMEOUT: u16 = 60;
 
 fn fs_dependency_timeout_default() -> u16 {
     DEFAULT_FS_DEPENDENCY_TIMEOUT
+}
+
+fn default_vmssr_true() -> bool {
+    false
 }
 
 fn fs_dependency_prop_default() -> String {
@@ -108,6 +113,15 @@ pub struct VmParameters {
     pub autostart: bool,
     #[serde(default)]
     pub on_demand_start_supported: bool,
+    #[serde(default = "default_vmssr_true")]
+    pub vm_ssr_enable: bool,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct UeventInfo {
+    pub vm_name: String,
+    pub event: String,
+    pub event_reason: u32,
 }
 
 #[derive(Default)]
@@ -123,7 +137,19 @@ pub struct VmInstance {
     // Upon client death, remove their callback.
     pub death_id: AtomicUsize,
     pub death_recipients: HashMap<usize, DeathRecipient>,
+    pub uevent_info: UeventInfo,
 }
+
+impl UeventInfo{
+    pub fn new(vmname: String, event: String, event_reason: u32) -> Self {
+        UeventInfo {
+            vm_name: vmname,
+            event: event,
+            event_reason: event_reason,
+        }
+    }
+}
+
 impl VmInstance {
     pub fn new(vm_parameters: VmParameters) -> Self {
         let inst = Self {
@@ -133,12 +159,15 @@ impl VmInstance {
             virtual_machine_callbacks: Vec::new(),
             death_id: AtomicUsize::new(0),
             death_recipients: HashMap::new(),
+            uevent_info : UeventInfo::new(String::new(),String::new(),0),
         };
         inst.set_vm_status_property("NOT_STARTED");
         return inst;
     }
 
-    pub fn notify_clients(&mut self, event: &str) -> () {
+    pub fn notify_clients(&mut self, event: &str, event_reason: &str) -> () {
+        let reason:u32 = event_reason.parse::<u32>().unwrap_or(0);
+        let mut reason_string:String = String::new();
         if event == "create" {
             info!(
                 "Event=create received for {}, state change to RUNNING",
@@ -153,6 +182,15 @@ impl VmInstance {
             );
             self.vm_state = VirtualMachineState::STOPPED;
             self.set_vm_status_property("STOPPED");
+            if reason > 3 {
+                info!(
+                    "Event=destroy received for {}, state change to CRASHED",
+                    self.vm_parameters.name
+                );
+                reason_string = format!("VM crashed and setting VM to crashed state");
+                self.vm_state = VirtualMachineState::VM_CRASHED;
+                self.set_vm_status_property("VM_CRASHED");
+            }
         }
 
         // notify_clients
@@ -164,9 +202,10 @@ impl VmInstance {
             return;
         }
         info!(
-            "Notifying {} clients of {}",
+            "Notifying {} clients of {} the reason for VM {}",
             self.virtual_machine_callbacks.len(),
-            self.vm_parameters.name
+            self.vm_parameters.name,
+            reason_string
         );
 
         for callback in &self.virtual_machine_callbacks {
@@ -198,10 +237,9 @@ impl VmInstance {
             kill(Pid::from_raw(*pid), Signal::SIGKILL)?;
         }
 
-        // This will block until the process exits, ensuring proper reaping
         if let Ok(status) = waitpid(
             Pid::from_raw(*pid),
-            None,
+            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
         ) {
             match status {
                 WaitStatus::Exited(pid, s) => {
@@ -209,7 +247,6 @@ impl VmInstance {
                         error!("PID:{pid} exit not success (0), result {s}");
                         return Err("Result {s}".into());
                     }
-                    info!("PID:{pid} exited with status: {:?}", status);
                 }
                 WaitStatus::Signaled(pid, sig, _) => {
                     info!("PID:{pid} terminated with signal: {sig}");
@@ -516,11 +553,17 @@ impl IVirtualMachine for VirtualMachine {
             }
 
             // Check for unsupported restart request
-            if instance.vm_state == VirtualMachineState::STOPPED {
-                error!("Request received from pid={} to start a Vm which is in stopped state, rejecting it.",
-                        ThreadState::get_calling_pid());
-                return Err(Status::new_service_specific_error_str(ERROR_VM_START,
-                        Some("Cannot start a Vm which is in STOPPED state.")));
+            if !instance.vm_parameters.vm_ssr_enable {
+                if instance.vm_state == VirtualMachineState::VM_CRASHED || instance.vm_state == VirtualMachineState::STOPPED {
+                    error!(
+                        "Request received from pid={} to start a Vm which is in STOPPED/CRASHED state, rejecting it.",
+                        ThreadState::get_calling_pid()
+                    );
+                    return Err(Status::new_service_specific_error_str(
+                        ERROR_VM_START,
+                        Some("Cannot start a Vm which is in STOPPED/CRASHED state.")
+                    ));
+                }
             }
 
             // Launch it!
@@ -543,5 +586,15 @@ impl IVirtualMachine for VirtualMachine {
             ExceptionCode::SERVICE_SPECIFIC,
             Some("Internal Error"),
         ));
+    }
+
+    fn unregister(&self) -> Result<(), Status> {
+        // TODO: add logic to unregister the VM
+        Ok(())
+    }
+
+    fn performtask_client(&self, _task: VirtualMachineClientTask) -> Result<(), Status> {
+        // TODO: handle the client task
+        Ok(())
     }
 }
