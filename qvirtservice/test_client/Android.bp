@@ -3,7 +3,7 @@ rust_binary {
     name: "qvirtservice_testclient",
     product_specific: true,
     srcs: ["test_client.rs"],
-    dylibs: [
+    rustlibs: [
         "vendor.qti.qvirt-V1-rust",
         "liblogger",
         "liblog_rust",

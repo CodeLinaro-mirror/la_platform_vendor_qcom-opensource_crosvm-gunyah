@@ -5,7 +5,7 @@ SPDX-License-Identifier: BSD-3-Clause-Clear
 <manifest version="1.0" type="framework">
    <hal format="aidl">
        <name>vendor.qti.qvirt</name>
-       <version>2</version>
+	   <version>2</version>
        <interface>
             <name>IVirtualizationService</name>
             <instance>default</instance>
