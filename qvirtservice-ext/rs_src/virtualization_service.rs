@@ -137,8 +137,36 @@ impl VirtualizationService {
                 let instance_for_thread = wrapper.instance.clone();
                 if fs_dep.no_fs_dependency {
                     let handle = thread::spawn(move || {
+                        let mut vm_ssr_enablecheck:bool = false;
+                        let mut vm_autostart_done:bool = false;
+                        let mut vm_autoshutdown_enablecheck:bool = false;
                         if let Ok(mut vm) = instance_for_thread.lock() {
                             vm.launch_autostart_vm();
+                            vm_ssr_enablecheck = vm.vm_parameters.vm_ssr_enable;
+                            vm_autostart_done = vm.autostart_done;
+                            vm_autoshutdown_enablecheck = vm.vm_parameters.vm_autoshutdown_enable;
+                            if vm.vm_parameters.vm_ssr_enable && vm.autostart_done{
+                                info!("autostart done, going to call autostart_connectvm");
+                                match vm.autostart_connectvm() {
+                                    Ok(0)=>{
+                                        info!("VM userpspace connection is successful");
+                                    },
+                                    Ok(_)=>{
+                                        info!("VM userspace connection is not successful, Will be placed in crashed state");
+                                    },
+                                    Err(response) => {
+                                        error!(
+                                            "VM: {} has been removed: {response}",
+                                            vm.vm_parameters.name
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if vm_ssr_enablecheck && vm_autoshutdown_enablecheck && vm_autostart_done {
+                            let vm_instance = instance_for_thread.clone();
+                            info!("Auto Shutdown Thread has been initiated");
+                            VmInstance::auto_shutdown_thread_handle_initiator(vm_instance);
                         }
                     });
                     no_fs_dependent_handles.push(handle);
@@ -146,6 +174,8 @@ impl VirtualizationService {
                     let fs_dep_prop = fs_dep.fs_dependency_prop.clone();
                     //Wait for timeout if fs dependent
                     thread::spawn(move || {
+                        let mut vm_ssr_enablecheck:bool = false;
+                        let mut vm_autoshutdown_enablecheck:bool = false;
                         let mut watcher = match system_properties::PropertyWatcher::new(&fs_dep_prop) {
                             Ok(w) => w,
                             Err(e) => {
@@ -165,6 +195,32 @@ impl VirtualizationService {
                             // Allows clients to register cbs during the wait.
                             if let Ok(mut vm) = instance_for_thread.lock() {
                                 vm.launch_autostart_vm();
+                                vm_ssr_enablecheck = vm.vm_parameters.vm_ssr_enable;
+                                vm_autoshutdown_enablecheck = vm.vm_parameters.vm_autoshutdown_enable;
+                                if vm.vm_parameters.vm_ssr_enable{
+                                    match vm.autostart_connectvm() {
+                                        Ok(-1)=>{
+                                            info!("VM userspace connect is not supported");
+                                        },
+                                        Ok(0)=>{
+                                            info!("VM userpspace connection is successful");
+                                        },
+                                        Ok(_)=>{
+                                            info!("VM userspace connection is not successful, Will be placed in crashed state");
+                                        },
+                                        Err(response) => {
+                                            error!(
+                                                "Client: {} has been removed: {response}",
+                                                vm.vm_parameters.name
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if vm_ssr_enablecheck && vm_autoshutdown_enablecheck {
+                                let vm_instance = instance_for_thread.clone();
+                                info!("Auto Shutdown Thread has been initiated");
+                                VmInstance::auto_shutdown_thread_handle_initiator(vm_instance);
                             }
                         } else {
                             error!("Timed out checking for {}.", fs_dep_prop);
@@ -274,7 +330,13 @@ impl VirtualizationService {
 
         // Uses serde_json to deserialize directly into strongly typed VmParameters object.
         let vendor_config_file = File::open(VENDOR_CONFIG_FILE)?;
-        let root: Value = serde_json::from_reader(vendor_config_file).unwrap();
+        let root: Value = match serde_json::from_reader(vendor_config_file){
+            Ok(parsed) => parsed,
+            Err(e) => {
+                    error!("Parsing of JSON file is incorrect : {}",e);
+                    return Err(format!("Error parsing JSON: {}",e).into());
+                }
+        };
         let json_config_array: &Vec<Value> = root
             .get("qvirtmgr")
             .and_then(|mgr| mgr.get("vm_config"))

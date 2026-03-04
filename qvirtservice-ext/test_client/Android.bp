@@ -4,7 +4,7 @@ rust_binary {
     product_specific: true,
     srcs: ["test_client.rs"],
     rustlibs: [
-        "vendor.qti.qvirt-V1-rust",
+        "vendor.qti.qvirt-V2-rust",
         "liblogger",
         "liblog_rust",
     ],
