@@ -54,6 +54,9 @@ qcrosvm_rust_binary {
         },
     },
     arch: {
+        arm: {
+            enabled: false,
+        },
         arm64: {
             rustlibs: ["libaarch64"],
         },
