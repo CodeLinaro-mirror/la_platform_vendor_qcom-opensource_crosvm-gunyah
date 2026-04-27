@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+      package="vendor.qti.microdroid_test">
+    <application android:label="MicrodroidTest" android:hasCode="false"/>
+
+</manifest>

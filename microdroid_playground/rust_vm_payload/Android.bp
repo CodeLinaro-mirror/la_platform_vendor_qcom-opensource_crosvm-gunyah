@@ -1,0 +1,18 @@
+// Rust wrappers round the C API for Rust clients.
+// (Yes, this involves going Rust -> C -> Rust.)
+rust_bindgen {
+    name: "libvm_payload_rs_bindgen",
+    wrapper_src: "include-restricted/vm_payload.h",
+    crate_name: "vm_payload_rs",
+    source_stem: "bindings",
+    bindgen_flags: [
+        "--default-enum-style rust",
+    ],
+    visibility: [
+        "//packages/modules/Virtualization:__subpackages__",
+        "//vendor:__subpackages__",
+        ],
+    shared_libs: [
+        "libvm_payload#current",
+    ],
+}

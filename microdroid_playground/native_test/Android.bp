@@ -1,0 +1,26 @@
+rust_binary {
+    name: "microdroid_native_test_client",
+    srcs: ["src/main.rs"],
+    edition: "2021",
+    prefer_rlib: true,
+    rustlibs: [
+        "android.system.virtualizationservice-rust",
+        "vendor.qcom.microdroid_test-rust",
+        "libandroid_logger",
+        "libanyhow",
+        "libbinder_rs",
+        "libtempfile",
+        "libglob",
+        "liblazy_static",
+        "liblibc",
+        "liblog_rust",
+        "librustutils",
+        "libshared_child",
+        "libnum_traits",
+        "libvmclient",
+    ],
+    apex_available: [
+        "//apex_available:platform",
+        "//apex_available:anyapex",
+    ],
+}
