@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="vendor.qti.microdroid_test.demo">
+
+    <uses-permission android:name="android.permission.MANAGE_VIRTUAL_MACHINE" />
+    <uses-sdk android:minSdkVersion="33" android:targetSdkVersion="33"/>
+    <uses-feature android:name="android.software.virtualization_framework" android:required="true" />
+    <application
+        android:label="TestPayloadAPK"
+        android:theme="@style/Theme.TestPayloadAPK"
+        android:testOnly="true">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>

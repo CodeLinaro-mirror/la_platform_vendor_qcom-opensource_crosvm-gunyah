@@ -1,0 +1,17 @@
+android_app {
+    name: "TestPayloadApp",
+    srcs: ["src/java/**/*.java"],
+    resource_dirs: ["src/res"],
+    static_libs: [
+        "androidx-constraintlayout_constraintlayout",
+        "androidx.appcompat_appcompat",
+        "vendor.qcom.microdroid_test-java",
+        "com.google.android.material_material",
+    ],
+    sdk_version: "system_current",
+    jni_libs: ["libtest_payload", "libtest_payload_rs"],
+    jni_uses_platform_apis: true,
+    use_embedded_native_libs: true,
+    v4_signature: true,
+    min_sdk_version: "33",
+}

@@ -1,0 +1,35 @@
+
+aidl_interface {
+    name: "vendor.qcom.microdroid_test",
+    srcs: ["vendor/qti/microdroid_test/**/*.aidl"],
+    unstable: true,
+    flags: [
+        // "-Werror",
+        // "-Wno-mixed-oneway",
+        // "-Wredundant-name",
+    ],
+    backend: {
+        java: {
+            gen_rpc: true,
+            enabled: true,
+            apex_available: [
+                "//apex_available:platform",
+                "//apex_available:anyapex"
+                ],
+        },
+        ndk: {
+            enabled: true,
+            apex_available: [
+                "//apex_available:platform",
+                "//apex_available:anyapex"
+                ],
+        },
+        rust: {
+            enabled: true,
+            apex_available: [
+                "//apex_available:platform",
+                "//apex_available:anyapex"
+                ],
+        },
+    },
+}

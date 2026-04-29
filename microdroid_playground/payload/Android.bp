@@ -1,0 +1,25 @@
+rust_defaults {
+    name: "libtest_payload_default_rs",
+    crate_name: "test_payload_rs",
+    srcs: ["src/lib.rs"],
+    rustlibs: [
+        "vendor.qcom.microdroid_test-rust",
+        "libandroid_logger",
+        // "librpcbinder_rs",
+        "libanyhow",
+        "libbinder_rs",
+        "liblibc",
+        "liblog_rust",
+        "librustutils",
+        // "libvm_payload_bindgen",
+        "libvm_payload_rs_bindgen",
+    ],
+
+    prefer_rlib: true,
+
+}
+
+rust_ffi {
+    name: "libtest_payload_rs",
+    defaults: ["libtest_payload_default_rs"],
+}
