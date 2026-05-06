@@ -34,6 +34,7 @@ qcrosvm_rust_binary {
     name: "qcrosvm",
     host_supported: false,
     system_ext_specific: true,
+    prefer_rlib: true,
     crate_name: "qcrosvm",
     srcs: ["src/main.rs"],
 
