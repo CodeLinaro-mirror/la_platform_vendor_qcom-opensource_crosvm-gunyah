@@ -71,6 +71,10 @@ fn default_vm_autoshutdown_enable() -> bool {
     false
 }
 
+fn default_vm_restart_enable() -> bool {
+    false
+}
+
 fn default_vmuserspace_waittimer() -> u32{
     DEFAULT_USERSPACE_WAIT_TIMER
 }
@@ -146,6 +150,8 @@ pub struct VmParameters {
     pub vsock_label: String,
     #[serde(default = "default_vmssr_true")]
     pub vm_ssr_enable: bool,
+    #[serde(default = "default_vm_restart_enable")]
+    pub vm_restart_enable: bool,
     #[serde(default = "default_vm_autoshutdown_enable")]
     pub vm_autoshutdown_enable: bool,
     #[serde(default)]
@@ -1276,15 +1282,15 @@ impl IVirtualMachine for VirtualMachine {
             }
 
             // Check for unsupported restart request
-            if !instance.vm_parameters.vm_ssr_enable {
+            if !instance.vm_parameters.vm_restart_enable {
                 if instance.vm_state == VirtualMachineState::VM_CRASHED || instance.vm_state == VirtualMachineState::STOPPED {
                     error!(
-                        "Request received from pid={} to start a Vm which is in STOPPED/CRASHED state, rejecting it.",
+                        "Request received from pid={} to start a Vm which is in STOPPED/CRASHED state with vm_restart_enable disabled, rejecting it.",
                         ThreadState::get_calling_pid()
                     );
                     return Err(Status::new_service_specific_error_str(
                         ERROR_VM_START,
-                        Some("Cannot start a Vm which is in STOPPED/CRASHED state.")
+                        Some("Cannot start a Vm which is in STOPPED/CRASHED state because vm_restart_enable is disabled.")
                     ));
                 }
             }
