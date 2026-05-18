@@ -1249,7 +1249,7 @@ impl IVirtualMachine for VirtualMachine {
 
     fn registerCallback(
         &self,
-        callback: &Strong<(dyn IVirtualMachineCallback)>,
+        callback: &Strong<dyn IVirtualMachineCallback>,
     ) -> Result<(), Status> {
         // Holds lock until cb registered
         if let Ok(mut instance) = self.vm_instance.lock() {
