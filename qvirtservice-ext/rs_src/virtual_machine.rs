@@ -1266,7 +1266,6 @@ impl IVirtualMachine for VirtualMachine {
 
             // Check if autostart and not complete yet
             if instance.vm_parameters.autostart
-                && !instance.vm_parameters.no_fs_dependency
                 && !instance.autostart_done
             {
                 error!("autostart enabled for this VM, requested start from pid={} while bootup ongoing, rejecting it.",
