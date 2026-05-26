@@ -1,0 +1,21 @@
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+cc_binary {
+    name: "microdroid_native_test_cpp",
+    defaults: ["avf_build_flags_cc"],
+    srcs: ["main.cpp"],
+    static_libs: [
+        "libbase",
+        "android.system.virtualizationservice-ndk",
+        "android.system.virtualizationcommon-ndk",
+        "vendor.qcom.microdroid_test-ndk",
+    ],
+    shared_libs: [
+        "libbinder_ndk",
+        "libbinder",
+        "liblog",
+        "libutils",
+    ],
+}

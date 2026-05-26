@@ -1,0 +1,10 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause-Clear
+
+[workspace]
+members = [ "native_test",
+    "payload",
+    "native_test", "rust_vm_payload",
+]
+
+workspace.resolver = "1"

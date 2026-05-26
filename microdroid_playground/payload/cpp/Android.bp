@@ -1,0 +1,18 @@
+cc_library_shared {
+    name: "libtest_payload",
+    srcs: ["test_payload_cpp.cpp"],
+    stl: "libc++_static",
+    shared_libs: [
+        "libbinder_ndk",
+        "libvm_payload#current",
+        "libc++",
+        "liblog",
+        "libbase",
+        "vendor.qcom.microdroid_test-ndk",
+    ],
+
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}
