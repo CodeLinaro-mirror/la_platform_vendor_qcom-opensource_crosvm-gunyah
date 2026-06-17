@@ -35,6 +35,7 @@ rust_bindgen {
 rust_binary {
     name: "vendor.qti.qvirt-service_rs",
     product_specific: true,
+    prefer_rlib: true,
     srcs: [
         "rs_src/main.rs",
     ],
