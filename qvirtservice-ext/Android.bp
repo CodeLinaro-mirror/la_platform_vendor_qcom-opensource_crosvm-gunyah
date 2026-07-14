@@ -30,6 +30,7 @@ rust_binary {
         "liblibc",
         "librustutils",
         "vendor.qti.qvirt-V2-rust",
+        "vendor.qti.qvirtvendor-V1-rust",
     ],
     rlibs: [
         "libuevent_ext_bindgen",

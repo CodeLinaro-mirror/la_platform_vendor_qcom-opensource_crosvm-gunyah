@@ -10,18 +10,19 @@ use std::{
     str::FromStr,
     sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex},
+    sync::mpsc::{channel, Sender},
     thread,
     time::Duration,
 };
 
-use libc::_exit;
+use libc::{pid_t, uid_t, _exit};
 
 use serde::Deserialize;
 
 use nix::{
     sys::signal::kill, sys::signal::Signal, sys::wait::waitpid,
     sys::wait::WaitPidFlag, sys::wait::WaitStatus, unistd::execv, unistd::fork,
-    unistd::ForkResult, unistd::Pid,
+    unistd::ForkResult, unistd::Pid, unistd::setsid, sys::wait::wait,
 };
 
 use rustutils::system_properties;
@@ -39,12 +40,24 @@ use vendor_qti_qvirt::binder::{
     Strong, ThreadState,
 };
 
+use vendor_qti_qvirtvendor::aidl::vendor::qti::qvirtvendor::{
+    IVendorVM::{BpVendorVM, IVendorVM},
+//    VendorVMState::VendorVMState,
+    VMErrorCodes::VMErrorCodes,
+    VMInfo::VMInfo,
+    VMTasks::VMTasks,
+};
+
+use vendor_qti_qvirtvendor::binder as vendor_binder;
+
 // ======================================================================
 // HELPERS
 // ======================================================================
 
 static VM_BINARY_FILE: &str = "/system_ext/bin/qcrosvm";
 static DEFAULT_FS_DEPENDENCY_TIMEOUT: u16 = 60;
+static DEFAULT_SSR_TIMEOUT: u32 = 60;
+static DEFAULT_USERSPACE_WAIT_TIMER: u32 = 120;
 
 fn fs_dependency_timeout_default() -> u16 {
     DEFAULT_FS_DEPENDENCY_TIMEOUT
@@ -52,6 +65,22 @@ fn fs_dependency_timeout_default() -> u16 {
 
 fn default_vmssr_true() -> bool {
     false
+}
+
+fn default_vm_autoshutdown_enable() -> bool {
+    false
+}
+
+fn default_vm_restart_enable() -> bool {
+    false
+}
+
+fn default_vmuserspace_waittimer() -> u32{
+    DEFAULT_USERSPACE_WAIT_TIMER
+}
+
+fn default_vmssr_timeout() -> u32{
+    DEFAULT_SSR_TIMEOUT
 }
 
 fn fs_dependency_prop_default() -> String {
@@ -113,8 +142,33 @@ pub struct VmParameters {
     pub autostart: bool,
     #[serde(default)]
     pub on_demand_start_supported: bool,
+    #[serde(default)]
+    pub mem: u32,
+    #[serde(default)]
+    pub cid: u64,
+    #[serde(default)]
+    pub vsock_label: String,
     #[serde(default = "default_vmssr_true")]
     pub vm_ssr_enable: bool,
+    #[serde(default = "default_vm_restart_enable")]
+    pub vm_restart_enable: bool,
+    #[serde(default = "default_vm_autoshutdown_enable")]
+    pub vm_autoshutdown_enable: bool,
+    #[serde(default)]
+    pub total_votes: u8,
+    #[serde(default = "default_vmssr_timeout")]
+    pub vm_ssr_timeout: u32,
+    #[serde(default = "default_vmuserspace_waittimer")]
+    pub vm_userspace_waittimer: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct VMClient {
+    pub vm_client_callback: Strong<dyn IVirtualMachineCallback>,
+    pub client_vote_count: u8,
+    pub pid: pid_t,
+    pub uid: uid_t,
+    pub death_id: usize,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -124,11 +178,23 @@ pub struct UeventInfo {
     pub event_reason: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct VendorVMInstance{
+    pub vendor_vm_instance: Arc<Mutex<Option<Strong <dyn IVendorVM>>>>,
+}
+
+#[derive(Clone)]
+pub struct AutoShutdownHandleStruct{
+    pub auto_shutdown_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+}
+
 #[derive(Default)]
 pub struct VmInstance {
     pub vm_state: VirtualMachineState,
     pub vm_parameters: VmParameters,
+    pub vm_clients: Vec<VMClient>,
 
+    pub vendorvminfo : VMInfo,
     pub autostart_done: bool,
 
     // Callbacks for the clients of this VM
@@ -138,6 +204,23 @@ pub struct VmInstance {
     pub death_id: AtomicUsize,
     pub death_recipients: HashMap<usize, DeathRecipient>,
     pub uevent_info: UeventInfo,
+    pub vendorvm_instance: VendorVMInstance,
+    pub auto_shutdown_thread_handler:AutoShutdownHandleStruct,
+    pub shutdown_notifier: Option<Sender<()>>,
+    pub childpid: Option<Pid>,
+//  pub vendorvm_state: VendorVMState,
+}
+
+impl VMClient{
+    pub fn new(vm_client_callback:Strong<dyn IVirtualMachineCallback>, pid: pid_t, uid:uid_t, did:usize ) -> Self {
+        VMClient {
+            vm_client_callback: vm_client_callback,
+            client_vote_count: 0,
+            pid:pid,
+            uid:uid,
+            death_id: did,
+        }
+    }
 }
 
 impl UeventInfo{
@@ -150,6 +233,22 @@ impl UeventInfo{
     }
 }
 
+impl Default for VendorVMInstance{
+    fn default() -> Self {
+        VendorVMInstance {
+            vendor_vm_instance: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl Default for AutoShutdownHandleStruct{
+    fn default() -> Self {
+        AutoShutdownHandleStruct {
+            auto_shutdown_thread: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
 impl VmInstance {
     pub fn new(vm_parameters: VmParameters) -> Self {
         let inst = Self {
@@ -158,8 +257,15 @@ impl VmInstance {
             autostart_done: false,
             virtual_machine_callbacks: Vec::new(),
             death_id: AtomicUsize::new(0),
+            vm_clients: Vec::new(),
             death_recipients: HashMap::new(),
+            vendorvminfo: VMInfo::default(),
             uevent_info : UeventInfo::new(String::new(),String::new(),0),
+            vendorvm_instance : VendorVMInstance::default(),
+            auto_shutdown_thread_handler: AutoShutdownHandleStruct::default(),
+            shutdown_notifier: None,
+            childpid: None,
+//          vendorvm_state: VendorVMState::VM_NOT_STARTED;
         };
         inst.set_vm_status_property("NOT_STARTED");
         return inst;
@@ -169,12 +275,24 @@ impl VmInstance {
         let reason:u32 = event_reason.parse::<u32>().unwrap_or(0);
         let mut reason_string:String = String::new();
         if event == "create" {
-            info!(
-                "Event=create received for {}, state change to RUNNING",
-                self.vm_parameters.name
-            );
-            self.vm_state = VirtualMachineState::RUNNING;
-            self.set_vm_status_property("RUNNING");
+            if self.vm_state == VirtualMachineState::RUNNING {
+                info!(
+                    "Event=create received for {}, state change to RUNNING",
+                    self.vm_parameters.name
+                );
+            }
+            else if self.vm_state == VirtualMachineState::VM_USERSPACE_READY {
+                info!(
+                    "Event=create received for {}, state change to VM_USERSPACE_READY",
+                    self.vm_parameters.name
+                );
+            }
+            else{
+                info!(
+                    "Event=create received for {}, Unknown VM state",
+                    self.vm_parameters.name
+                );
+            }
         } else if event == "destroy" {
             info!(
                 "Event=destroy received for {}, state change to STOPPED",
@@ -194,7 +312,7 @@ impl VmInstance {
         }
 
         // notify_clients
-        if self.virtual_machine_callbacks.is_empty() {
+        if self.vm_clients.is_empty() {
             info!(
                 "No clients registered for {} callback yet.",
                 self.vm_parameters.name
@@ -203,16 +321,16 @@ impl VmInstance {
         }
         info!(
             "Notifying {} clients of {} the reason for VM {}",
-            self.virtual_machine_callbacks.len(),
+            self.vm_clients.len(),
             self.vm_parameters.name,
             reason_string
         );
 
-        for callback in &self.virtual_machine_callbacks {
-            match callback.onStatusChanged(self.vm_state) {
+        for vm_client in &self.vm_clients {
+            match vm_client.vm_client_callback.onStatusChanged(self.vm_state) {
                 Ok(_) => {
                     debug!("notify_clients: {}-CallbackObject[ClientId: {:?}]->onStatusChanged({:?}): success",
-                        self.vm_parameters.name, callback.as_binder(), self.vm_state);
+                        self.vm_parameters.name, vm_client.vm_client_callback.as_binder(), self.vm_state);
                 }
                 _ => {
                     debug!("notify_clients: {}-CallbackObject[ClientId]->onStatusChanged({:?}): success",
@@ -237,22 +355,32 @@ impl VmInstance {
             kill(Pid::from_raw(*pid), Signal::SIGKILL)?;
         }
 
-        if let Ok(status) = waitpid(
+        match waitpid(
             Pid::from_raw(*pid),
-            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
+            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED | WaitPidFlag::WEXITED | WaitPidFlag::WSTOPPED),
         ) {
+            Ok(status)=>{
+            info!("Status of waitforpid: {:?}",status);
             match status {
                 WaitStatus::Exited(pid, s) => {
                     if s > 0 {
                         error!("PID:{pid} exit not success (0), result {s}");
+                        info!("Enter Exited");
                         return Err("Result {s}".into());
                     }
                 }
                 WaitStatus::Signaled(pid, sig, _) => {
                     info!("PID:{pid} terminated with signal: {sig}");
+                    info!("Enter Signaled");
+                    return Err("Result {sig}".into());
                 }
-                _ => { /* pass through */ }
+                _ => {/* pass through */
+                info!("Enter all other conditions");}
             };
+            }
+            Err(_)=>{
+                info!("No Status found waitpid failed");
+            }
         }
         return Ok(());
     }
@@ -277,46 +405,106 @@ impl VmInstance {
         }
         args.push(CString::new(format!("--vm={}", self.vm_parameters.name))?);
 
-        // Do fork and exec
-        match unsafe { fork() } {
-            Ok(ForkResult::Parent { child }) => {
-                pid = child.into();
-                thread::sleep(Duration::new(
-                    self.vm_parameters.boot_wait_time.into(),
-                    0,
-                ));
+        //Static CID additions
+        if self.vm_parameters.cid > 0 && self.vm_parameters.vsock_label.is_empty() != true
+       {
+            args.push(CString::new(format!(
+                "--vsock=label={},cid={}",
+                self.vm_parameters.vsock_label,
+                self.vm_parameters.cid
+            ))?);
+        }
 
-                // Wait for qcrosvm to exit
-                match Self::wait_for_exit(&pid, Some(false)) {
-                    Ok(_) => {
-                        return Ok(pid);
+        //Total Memory Check
+        if self.vm_parameters.mem > 0
+        {
+            args.push(CString::new(format!(
+                "--mem={}",
+                self.vm_parameters.mem
+            ))?);
+        }
+
+        // Do fork and exec
+        match unsafe {fork()}{
+            Ok(ForkResult::Parent { .. }) => {
+                match wait(){
+                    Ok(WaitStatus::Exited(_, _)) => {
+                        info!("First Child exited, Parent continues");
                     }
-                    Err(_) => {
-                        error!("{}: qcrosvm exited unexpectedly", self.vm_parameters.name);
-                        return Err("qcrosvm exited unexpectedly".into());
+                    Ok(WaitStatus::Signaled(_, _, _)) => {
+                        info!("First Child terminated by a signal");
+                    }
+                    Ok(_) => {
+                        info!("Unexpected Status from wait.");
+                    }
+                    Err(e) => {
+                        error!("Fork Error{:?}",e);
+                        error!("{}: first child exited unexpectedly", self.vm_parameters.name);
+                        return Err("first child exited unexpectedly".into());
                     }
                 }
+                info!("Done with work here");
+                return Ok(0);
             }
             Ok(ForkResult::Child) => {
-                let args_obj: Vec<&CStr> =
-                    args.iter().map(|c| c.as_c_str()).collect();
-                match execv(args_obj[0], &args_obj) {
-                    Ok(_) => {}
-                    Err(_) => {
-                        error!("+----------------------------------------+");
-                        error!(
-                            "\t{}: launch failed. exiting...",
-                            self.vm_parameters.name
-                        );
-                        error!("+----------------------------------------+");
+                match unsafe { fork() } {
+                    Ok(ForkResult::Parent { child }) => {
+                        pid = child.into();
+                        thread::sleep(Duration::new(
+                            self.vm_parameters.boot_wait_time.into(),
+                            0,
+                        ));
+
+                        // Wait for qcrosvm to exit
+                        match Self::wait_for_exit(&pid, Some(false)) {
+                            Ok(_) => {
+                                self.childpid = Some(Pid::from_raw(pid).clone());
+                                return Ok(pid);
+                            }
+                            Err(_) => {
+                                error!("{}: qcrosvm exited unexpectedly", self.vm_parameters.name);
+                                return Err("qcrosvm exited unexpectedly".into());
+                            }
+                        }
                     }
-                }
-                unsafe {
-                    _exit(1);
+                    Ok(ForkResult::Child) => {
+                        let args_obj: Vec<&CStr> =
+                            args.iter().map(|c| c.as_c_str()).collect();
+                        match setsid(){
+                                        Ok(_) => {
+                                        match execv(args_obj[0], &args_obj) {
+                                           Ok(_) => {info!("Launch Successful");}
+                                           Err(_) => {
+                                           error!("+----------------------------------------+");
+                                           error!(
+                                           "\t{}: launch failed. exiting...",
+                                           self.vm_parameters.name
+                                           );
+                                           error!("+----------------------------------------+");
+                                     }
+                                }
+                            }
+                            Err(_) =>{
+                                error!("+----------------------------------------+");
+                                error!(
+                                    "\t{}: launch failed. exiting...",
+                                    self.vm_parameters.name
+                                );
+                                error!("+----------------------------------------+");
+                            }
+                        }
+                        unsafe {
+                            _exit(1);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Second Child Fork failed = {}", e);
+                        return Err("Fork failed".into());
+                    }
                 }
             }
             Err(e) => {
-                error!("Fork failed = {}", e);
+                error!("Parent Child Fork failed = {}", e);
                 return Err("Fork failed".into());
             }
         }
@@ -360,9 +548,33 @@ impl VmInstance {
 
     fn launch_vm(&mut self) -> Result<i32, Box<dyn Error>> {
         info!("Requested launchVM for {}", self.vm_parameters.name);
+        let vm_ssr_enable_runtime_prop_owned = match system_properties::read("ro.vendor.vm.ssr.enable") {
+            Ok(Some(s)) => s,
+            _ => {
+                info!("ro.vendor.vm.ssr.enable missing/unreadable; defaulting to false");
+                "false".to_string()
+            }
+        };
+        let vm_ssr_enable_runtime_prop: &str = &vm_ssr_enable_runtime_prop_owned;
+        debug!("VM Restart flag value : {}", vm_ssr_enable_runtime_prop);
+        if self.vm_parameters.vm_ssr_enable && vm_ssr_enable_runtime_prop != "true"{
+            debug!("Please check with the VM team. The feature flag has not been set correctly");
+            self.vm_parameters.vm_ssr_enable = false
+        }
+        if !self.vm_parameters.vm_ssr_enable && vm_ssr_enable_runtime_prop == "true" {
+            debug!("Please check with the VM team. The feature flag in the config has not been set correctly");
+            self.vm_parameters.vm_ssr_enable = false
+        }
+        if self.vm_parameters.vm_ssr_enable && vm_ssr_enable_runtime_prop == "true"{
+            debug!("VM Shutdown Feature has been enabled");
+        }
         if self.vm_state == VirtualMachineState::RUNNING {
             info! {"{} is already in running state.", self.vm_parameters.name};
             return Ok(0);
+        }
+        else if self.vm_state == VirtualMachineState::VM_USERSPACE_READY {
+            info! {"{} is already running and in userspace ready state.", self.vm_parameters.name};
+            return Ok(1);
         }
         return self.boot_sequence();
     }
@@ -376,14 +588,524 @@ impl VmInstance {
                 self.vm_parameters.name
             );
         }
-
+        self.vm_state = VirtualMachineState::RUNNING;
+        self.set_vm_status_property("RUNNING");
         self.autostart_done = true;
     }
 
     fn set_vm_status_property(&self, vm_status: &str) -> () {
+        info!("For {} VM state is being set to {:?}", self.vm_parameters.name, vm_status);
         let vm_status_prop =
             format!("vendor.qvirtmgr.{}.status", self.vm_parameters.name);
         let _res = system_properties::write(&vm_status_prop, vm_status); // Ignore the result.
+    }
+
+
+    // Vendor VM Functions
+
+    fn get_vendorvm_instance(&self) -> Result<(),String>{
+        let mut vendorvm_instance = self.vendorvm_instance.vendor_vm_instance.lock().unwrap();
+        if self.vm_parameters.vm_ssr_enable && vendorvm_instance.is_none(){
+            let vendorvm_description:String = BpVendorVM::get_descriptor().to_owned() + "/default";
+            match vendor_binder::get_interface::<dyn IVendorVM>(&vendorvm_description){
+                Ok(instance) => {
+                    *vendorvm_instance = Some(instance);
+                }
+                Err(e) => {
+                    return Err(e.to_string());
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    fn set_vendor_vm_info(&mut self) -> () {
+        self.vendorvminfo.name = self.vm_parameters.name.clone();
+        self.vendorvminfo.cid = self.vm_parameters.cid as i64;
+    }
+
+    // handle communication with Vendor VM HAL
+
+    fn connect_vendorvm(&mut self)-> Result<i32, Box<dyn Error>> {
+        let mut boot_try = 0u8;
+        loop{
+            boot_try += 1;
+            if boot_try == 1 {
+                info!("Waiting for VM Userspace to be up for the first time");
+                thread::sleep(Duration::new(
+                                self.vm_parameters.vm_userspace_waittimer.into(),
+                                0,
+                            ));
+            }
+            match self.get_vendorvm_instance(){
+                Ok(_) => {
+                    let vendorvm_instance = self.vendorvm_instance.vendor_vm_instance.lock().unwrap();
+                    if let Some(ref vendorvm_instance_unwrap) = *vendorvm_instance{
+                        match vendorvm_instance_unwrap.connectvm(&self.vendorvminfo){
+                            Ok(VMErrorCodes::SUCCESS) => {
+                                self.vm_state = VirtualMachineState::VM_USERSPACE_READY;
+                                self.set_vm_status_property("VM_USERSPACE_READY");
+                                info!("Connection was successful");
+                                return Ok(0);
+                            },
+                            Ok(_) => {
+                                let response_fail: String = "Connection failed".to_string();
+                                if boot_try < self.vm_parameters.try_count {
+                                    error!(
+                                        "VM User Space Connection failed for {}, trying again",
+                                        self.vm_parameters.name
+                                    );
+                                    thread::sleep(Duration::new(
+                                        self.vm_parameters.vm_ssr_timeout.into(),
+                                        0,
+                                    ));
+                                    continue;
+                                } else {
+                                    error!(
+                                        "{} Boot Failed!!! No. of attempts: {boot_try}",
+                                        self.vm_parameters.name
+                                    );
+                                    info!("VM being set in crashed state and connections will not be allowed");
+                                    if self.childpid != None{
+                                        match kill(self.childpid.unwrap(),Signal::SIGKILL){
+                                            Ok(_) => {
+                                                info!("Killing vm Instance and Setting Crashed state");
+                                            },
+                                            Err(e) => {
+                                                error!("{}", format!("Error Killing VM instance {}",e));
+                                            }
+                                        }
+                                    }
+                                    self.vm_state = VirtualMachineState::VM_CRASHED;
+                                    self.set_vm_status_property("VM_CRASHED");
+                                    return Err(Box::new(Status::new_service_specific_error_str(
+                                        ERROR_VM_START,
+                                        Some(response_fail.to_string()),
+                                    )));
+                                }
+                            },
+                            Err(response) => {
+                                if boot_try < self.vm_parameters.try_count {
+                                    error!(
+                                        "Vendor VM User Space Connection failed for {}, trying again",
+                                        self.vm_parameters.name
+                                    );
+                                    thread::sleep(Duration::new(
+                                        self.vm_parameters.vm_ssr_timeout.into(),
+                                        0,
+                                    ));
+                                    continue;
+                                } else {
+                                    error!(
+                                        "{} Boot Failed!!! No. of attempts: {boot_try}",
+                                        self.vm_parameters.name
+                                    );
+                                    info!("VM being set in crashed state and connections will not be allowed as Error");
+                                    if self.childpid != None{
+                                        match kill(self.childpid.unwrap(),Signal::SIGKILL){
+                                            Ok(_) => {
+                                                info!("Killing vm Instance and Setting Crashed state");
+                                            },
+                                            Err(e) => {
+                                                error!("{}", format!("Error Killing VM instance {}",e));
+                                            }
+                                        }
+                                    }
+                                    self.vm_state = VirtualMachineState::VM_CRASHED;
+                                    self.set_vm_status_property("VM_CRASHED");
+                                    return Err(Box::new(Status::new_service_specific_error_str(
+                                        ERROR_VM_START,
+                                        Some(response.to_string()),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(response) => {
+                    if self.childpid != None{
+                        info!("Vendor VM communication failed");
+                        match kill(self.childpid.unwrap(),Signal::SIGKILL){
+                            Ok(_) => {
+                                info!("Killing vm Instance and Setting Crashed state");
+                            },
+                            Err(e) => {
+                                error!("{}", format!("Error Killing VM instance {}",e));
+                            }
+                        }
+                    }
+                    self.vm_state = VirtualMachineState::VM_CRASHED;
+                    self.set_vm_status_property("VM_CRASHED");
+                    return Err(Box::new(Status::new_service_specific_error_str(
+                        ERROR_VM_START,
+                        Some(response.to_string()),
+                    )));
+                }
+            }
+        }
+    }
+
+    fn disconnect_vendorvm(&mut self)-> Result<i32, Box<dyn Error>> {
+        let mut boot_try = 0u8;
+        loop{
+            boot_try += 1;
+            match self.get_vendorvm_instance(){
+                Ok(_) => {
+                    let mut vendorvm_instance = self.vendorvm_instance.vendor_vm_instance.lock().unwrap();
+                    if let Some(ref vendorvm_instance_unwrap) = *vendorvm_instance{
+                        match vendorvm_instance_unwrap.disconnectvm(&self.vendorvminfo){
+                            Ok(VMErrorCodes::SUCCESS) => {
+                                info!("Disconnection was successful");
+                                // Reset the instance to None
+                                *vendorvm_instance = None;
+                                info!("vendor_vm_instance reset to None");
+                                return Ok(0);
+                            },
+                            Ok(_) => {
+                                let response_fail: String = "Connection failed".to_string();
+                                if boot_try < self.vm_parameters.try_count {
+                                    error!(
+                                        "Vendor VM disconnection failed for {}, trying again",
+                                        self.vm_parameters.name
+                                    );
+                                    thread::sleep(Duration::new(
+                                        self.vm_parameters.vm_ssr_timeout.into(),
+                                        0,
+                                    ));
+                                    continue;
+                                } else {
+                                    error!(
+                                        "{} Disconnection Failed!!! No. of attempts: {boot_try}",
+                                        self.vm_parameters.name
+                                    );
+                                    return Err(Box::new(Status::new_service_specific_error_str(
+                                        ERROR_VM_START,
+                                        Some(response_fail.to_string()),
+                                    )));
+                                }
+                            },
+                            Err(response) => {
+                                if boot_try < self.vm_parameters.try_count {
+                                    error!(
+                                        "Vendor VM disconnection failed for {}, trying again",
+                                        self.vm_parameters.name
+                                    );
+                                    thread::sleep(Duration::new(
+                                        self.vm_parameters.vm_ssr_timeout.into(),
+                                        0,
+                                    ));
+                                    continue;
+                                } else {
+                                    error!(
+                                        "{} Disconnection Failed!!! No. of attempts: {boot_try}",
+                                        self.vm_parameters.name
+                                    );
+                                    return Err(Box::new(Status::new_service_specific_error_str(
+                                        ERROR_VM_START,
+                                        Some(response.to_string()),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(response) => {
+                    if self.childpid != None{
+                        match kill(self.childpid.unwrap(),Signal::SIGKILL){
+                            Ok(_) => {
+                                info!("Disconnect: Killing Vendor vm Instance and Setting Crashed state");
+                            },
+                            Err(e) => {
+                                error!("{}", format!("Error Killing Vendor  VM instance {}",e));
+                            }
+                        }
+                    }
+                    self.vm_state = VirtualMachineState::VM_CRASHED;
+                    self.set_vm_status_property("VM_CRASHED");
+                    return Err(Box::new(Status::new_service_specific_error_str(
+                        ERROR_VM_START,
+                        Some(response.to_string()),
+                    )));
+                }
+            }
+        }
+    }
+
+    fn prfmtsk_vendorvm(&mut self,vm_task: VMTasks)-> Result<i32, Box<dyn Error>> {
+        let mut boot_try = 0u8;
+        loop{
+            boot_try += 1;
+            match self.get_vendorvm_instance(){
+                Ok(_) => {
+                    let vendorvm_instance = self.vendorvm_instance.vendor_vm_instance.lock().unwrap();
+                    if let Some(ref vendorvm_instance_unwrap) = *vendorvm_instance{
+                        match vendorvm_instance_unwrap.performtaskvm(&self.vendorvminfo, vm_task){
+                            Ok(VMErrorCodes::SUCCESS) => {
+                                self.vm_state = VirtualMachineState::STOPPED;
+                                self.set_vm_status_property("STOPPED");
+                                info!("Shutdown was successful");
+                                return Ok(0);
+                            },
+                            Ok(_) => {
+                                let response_fail: String = "Connection failed".to_string();
+                                if boot_try < self.vm_parameters.try_count {
+                                    error!(
+                                        " Vendor VM User Space Connection failed for {}, trying again",
+                                        self.vm_parameters.name
+                                    );
+                                    thread::sleep(Duration::new(
+                                        self.vm_parameters.vm_ssr_timeout.into(),
+                                        0,
+                                    ));
+                                    continue;
+                                } else {
+                                    error!(
+                                        "{} Perform Task Failed !!! No. of attempts: {boot_try}",
+                                        self.vm_parameters.name
+                                    );
+                                    return Err(Box::new(Status::new_service_specific_error_str(
+                                        ERROR_VM_START,
+                                        Some(response_fail.to_string()),
+                                    )));
+                                }
+                            },
+                            Err(response) => {
+                                if boot_try < self.vm_parameters.try_count {
+                                    error!(
+                                        "VM User Space Connection failed for {}, trying again",
+                                        self.vm_parameters.name
+                                    );
+                                    thread::sleep(Duration::new(
+                                        self.vm_parameters.vm_ssr_timeout.into(),
+                                        0,
+                                    ));
+                                    continue;
+                                } else {
+                                    error!(
+                                        "{} Perform Task Failed!!! No. of attempts: {boot_try}",
+                                        self.vm_parameters.name
+                                    );
+                                    return Err(Box::new(Status::new_service_specific_error_str(
+                                        ERROR_VM_START,
+                                        Some(response.to_string()),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(response) => {
+                    info!("Not able to get Vendor VM instance inside Perform Task, Hence killing VM");
+                    if self.childpid != None{
+                        match kill(self.childpid.unwrap(),Signal::SIGKILL){
+                            Ok(_) => {
+                                info!("Killing vm Instance and Setting Crashed state");
+                            },
+                            Err(e) => {
+                                error!("{}", format!("Error Killing VM instance {}",e));
+                            }
+                        }
+                    }
+                    self.vm_state = VirtualMachineState::VM_CRASHED;
+                    self.set_vm_status_property("VM_CRASHED");
+                    return Err(Box::new(Status::new_service_specific_error_str(
+                        ERROR_VM_START,
+                        Some(response.to_string()),
+                    )));
+                }
+            }
+        }
+    }
+
+    fn vm_client_unregister(&mut self) -> Result<i32, Box<dyn Error>> {
+        match self.vm_clients.is_empty(){
+            true =>{
+                let response =format!("No Callbacks have been registered for the VM : {}",self.vm_parameters.name);
+                    error!("{}",response);
+                    return Err(response.into());
+            },
+            false => {
+                if let Some(idx) = self.vm_clients
+                .iter()
+                .position(|client_info| client_info.pid == ThreadState::get_calling_pid() && client_info.uid == ThreadState::get_calling_uid())
+                {
+                    debug!("Callback is being removed in VM {} for the following id: {}, pid: {}, uid: {}",
+                    self.vm_parameters.name,self.vm_clients[idx].death_id,self.vm_clients[idx].pid,self.vm_clients[idx].uid);
+                    self.death_recipients.remove(&self.vm_clients[idx].death_id);
+                    self.vm_clients.remove(idx);
+                    return Ok(0);
+                }
+                let response = format!("No Callbacks have been registered for the client in the VM : {}",self.vm_parameters.name);
+                error!("{}",response);
+                return Err(response.into());
+            }
+        }
+    }
+
+    fn start_auto_shutdown(&mut self) -> Result<i32, Box<dyn Error>> {
+        match self.prfmtsk_vendorvm(VMTasks::VM_SHUTDOWN){
+            Ok(0) => {
+                info!("VM Shutdown was succesful. Going forward to disconnecting all the VM's ");
+                //Initiate the connection to the vendor VM and connect with the QTVM
+                match self.disconnect_vendorvm(){
+                    Ok(0) => {
+                        info!("VM disonnection is set and we have shutdown the VM");
+                    },
+                    Ok(_) => {
+                        info!("VM disonnection is not successful. Please do a cleanup");
+                    },
+                    Err(response) => {
+                        error!(
+                            "VM has been disconnected: {} has been removed: {response}",
+                            self.vm_parameters.name
+                        );
+                        return Err(Box::new(Status::new_service_specific_error_str(
+                            ERROR_VM_START,
+                            Some(response.to_string()),
+                        )));
+                    }
+                }
+                self.vm_state = VirtualMachineState::STOPPED;
+                self.set_vm_status_property("STOPPED");
+                return Ok(0);
+            },
+            Ok(_) => {
+                info!("VM Shutdown was not succesful. Resetting timers ");
+                return Ok(1);
+            }
+            Err(response) => {
+                error!(
+                    "Shutdown was not successful: {} It will be removed: {response}",
+                    self.vm_parameters.name
+                );
+                return Err(Box::new(Status::new_service_specific_error_str(
+                    ERROR_VM_START,
+                    Some(response.to_string()),
+                )));
+            }
+        }
+    }
+
+    pub fn autostart_connectvm(&mut self)-> Result<i32, Box<dyn Error>> {
+        if self.vm_parameters.vm_ssr_enable && self.autostart_done{
+            self.set_vendor_vm_info();
+            match self.connect_vendorvm(){
+                Ok(_) => {
+                    info!("VM Connection is set and we have connected to userspace");
+                    //Initiate the connection to the vendor VM and connect with the QTVM
+                    self.vm_state = VirtualMachineState::VM_USERSPACE_READY;
+                    self.set_vm_status_property("VM_USERSPACE_READY");
+                    return Ok(0);
+                },
+                Err(response) => {
+                    error!(
+                        "VM: {} has been removed: {response}",
+                        self.vm_parameters.name
+                    );
+                    if self.childpid != None{
+                        match kill(self.childpid.unwrap(),Signal::SIGKILL){
+                            Ok(_) => {
+                                info!("Killing vm Instance and Setting Crashed state");
+                            },
+                            Err(e) => {
+                                error!("{}", format!("Error Killing VM instance {}",e));
+                            }
+                        }
+                    }
+                    self.vm_state = VirtualMachineState::VM_CRASHED;
+                    self.set_vm_status_property("VM_CRASHED");
+                    return Err(Box::new(Status::new_service_specific_error_str(
+                        ERROR_VM_START,
+                        Some(response.to_string()),
+                    )));
+                }
+            }
+        }
+        else{
+            info!("HAL does not support to connect to userspace,");
+			let response="HAL does not support to connect to userspace,";
+            return Err(Box::new(Status::new_service_specific_error_str(
+                ERROR_VM_START,
+                Some(response.to_string()),
+            )));
+        }
+    }
+
+    pub fn auto_shutdown_thread_handle_initiator(self_instance: Arc<Mutex<Self>>) -> () {
+        let vm_instance = Arc::clone(&self_instance);
+
+        {
+            let vminstance = self_instance.lock().unwrap();
+
+            if let Some(vminstance_shutdown_notifier) = &vminstance.shutdown_notifier{
+                let _ = vminstance_shutdown_notifier.send(());
+            }
+
+            let  mut shutdown_thread_instance = vminstance.auto_shutdown_thread_handler.auto_shutdown_thread.lock().unwrap();
+            if let Some(shutdown_thread) = shutdown_thread_instance.take()
+            {
+                let _ = shutdown_thread.join();
+            }
+        }
+        {
+            let mut vminstance = self_instance.lock().unwrap();
+            let (tx,rx) = channel();
+            vminstance.shutdown_notifier = Some(tx);
+            let vm_ssr_timeout = vminstance.vm_parameters.vm_ssr_timeout;
+
+            let new_auto_shutdown_handle: thread::JoinHandle<()> = thread::spawn(move || {
+                let boot_try = 0u8;
+                loop {
+                    info!("Inside Auto shutdown loop");
+                    if let Ok(_) = rx.recv_timeout(Duration::from_secs(vm_ssr_timeout.into())){
+                        break;
+                    }
+                    if let Ok(mut instance) = vm_instance.lock(){
+                        info!("Printing the State Inside the VM for Name: {} , State: {:?}",instance.vm_parameters.name, instance.vm_state);
+                        if instance.vm_parameters.total_votes == 0 && instance.vm_state == VirtualMachineState::VM_USERSPACE_READY {
+                            match instance.start_auto_shutdown(){
+                            Ok(0) => {
+                                info!("Shutdown is successful");
+                                break;
+                            },
+                            Ok(_) => {
+                                info!("Shutdown is not successful resetting timers");
+                                drop(instance);
+                                thread::sleep(Duration::from_secs(600));
+                                continue;
+                            },
+                            Err(response) => {
+                                        if boot_try < instance.vm_parameters.try_count {
+                                        error!(
+                                            "Shutdown failed for VM: {}, trying again",
+                                            instance.vm_parameters.name
+                                        );
+                                        thread::sleep(Duration::new(
+                                            instance.vm_parameters.vm_ssr_timeout.into(),
+                                            0,
+                                        ));
+                                        continue;
+                                    } else {
+                                        error!(
+                                            "{} Shutdown Failed!!! No. of attempts: {boot_try} reason: {}",
+                                            instance.vm_parameters.name,response.to_string()
+                                        );
+                                        drop(instance);
+                                        thread::sleep(Duration::from_secs(600));
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        else{
+                            drop(instance);
+                            thread::sleep(Duration::from_secs(600));
+                        }
+                    }
+                }
+            });
+            vminstance.auto_shutdown_thread_handler.auto_shutdown_thread = Arc::new(Mutex::new(Some(new_auto_shutdown_handle)));
+        }
     }
 }
 
@@ -445,9 +1167,9 @@ impl IVirtualMachine for VirtualMachine {
 
             // Check if the callback is duplicate
             if instance
-                .virtual_machine_callbacks
+                .vm_clients
                 .iter()
-                .any(|cb| cb == callback)
+                .any(|client_info| client_info.vm_client_callback == *callback)
             {
                 error!("Duplicate request from CallbackObject for {} from pid={}, uid={}",
                     instance.vm_parameters.name, ThreadState::get_calling_pid(), ThreadState::get_calling_uid());
@@ -456,12 +1178,11 @@ impl IVirtualMachine for VirtualMachine {
                     Some("The callback is already registered"),
                 ));
             }
-            instance.virtual_machine_callbacks.push(callback.clone());
+            let id = instance.death_id.fetch_add(1, Ordering::SeqCst); // Generate unique ID for the hashmap.
+            let client_info = VMClient::new(callback.clone(), ThreadState::get_calling_pid(), ThreadState::get_calling_uid(),id);
+            instance.vm_clients.push(client_info.clone());
 
             // Register death notification to remove the cb when client dies.
-            let id = instance.death_id.fetch_add(1, Ordering::SeqCst); // Generate unique ID for the hashmap.
-            let pid = ThreadState::get_calling_pid();
-            let uid = ThreadState::get_calling_uid();
             let vm_instance_clone = self.vm_instance.clone();
             let callback_clone = callback.clone();
             // Create the death notification callback
@@ -469,37 +1190,43 @@ impl IVirtualMachine for VirtualMachine {
                 // Find and remove the stored callback and DeathRecipient.
                 if let Ok(mut vm_instance) = vm_instance_clone.lock() {
                     info!(
-                        "Recieved death notification for {} - client {id} with pid={pid}, uid={uid}!",
-                        vm_instance.vm_parameters.name);
-                    if let Some(idx) = vm_instance
-                        .virtual_machine_callbacks
-                        .iter()
-                        .position(|cb| *cb == callback_clone)
-                    {
-                        debug!(
-                            "Cleared the callback object for {} - client {id} with pid={pid}, uid={uid}!",
-                            vm_instance.vm_parameters.name);
-                        vm_instance.virtual_machine_callbacks.remove(idx);
-                    } else {
-                        // Strange case
-                        debug!(
-                            "Callback object not found for {} - client {id} with pid={pid}, uid={uid}!",
-                            vm_instance.vm_parameters.name);
+                        "Recieved death notification for {} - client {} with pid={}, uid={}!",
+                        vm_instance.vm_parameters.name,client_info.death_id,client_info.pid,client_info.uid);
+                    match vm_instance.vm_clients.is_empty(){
+                        true => {
+                                // Client registered but not callback which is  not possible
+                            debug!(
+                                "No Callback object present for {} - client {} with pid={}, uid={}!",
+                                vm_instance.vm_parameters.name,client_info.death_id,client_info.pid,client_info.uid);
+                            },
+                        false =>{
+                            if let Some(idx) = vm_instance.vm_clients.iter().position(|client_info| client_info.vm_client_callback == callback_clone)
+                            {
+                                debug!(
+                                    "Cleared the callback object for {} - client {} with pid={}, uid={}!",
+                                    vm_instance.vm_parameters.name,client_info.death_id,client_info.pid,client_info.uid);
+                                vm_instance.vm_clients.remove(idx);
+                            }
+                            // Strange case
+                            debug!(
+                                "Callback object not found for {} - client {} with pid={}, uid={}!",
+                                vm_instance.vm_parameters.name,client_info.death_id,client_info.pid,client_info.uid);
+                        }
                     }
                     // If death notification triggered, it is guaranteed that this death recipient is stale.
                     // Remove it regardless of if cb was found. It cannot be triggered again.
-                    vm_instance.death_recipients.remove(&id);
+                    vm_instance.death_recipients.remove(&client_info.death_id);
                 }
             });
             let mut cb_binder = callback.as_binder();
             cb_binder.link_to_death(&mut death_recipient)?;
 
             debug!(
-                "Registered callback for {} - client {id} with pid={pid}, uid={uid}!",
-                instance.vm_parameters.name);
+                "Registered callback for {} - client {} with pid={}, uid={}!",
+                instance.vm_parameters.name,client_info.death_id,client_info.pid,client_info.uid);
 
             // Add DeathRecipient to a vector to keep it alive.
-            instance.death_recipients.insert(id, death_recipient);
+            instance.death_recipients.insert(client_info.death_id, death_recipient);
             return Ok(());
         }
         // Strange case, mutex poisoned.
@@ -510,6 +1237,8 @@ impl IVirtualMachine for VirtualMachine {
     }
 
     fn start(&self) -> Result<(), Status> {
+        let vm_launch_result : i32;
+        let vm_launch_result_response : String;
         if let Ok(mut instance) = self.vm_instance.lock() {
             // Holds lock until completely done with boot.
             info!(
@@ -537,7 +1266,6 @@ impl IVirtualMachine for VirtualMachine {
 
             // Check if autostart and not complete yet
             if instance.vm_parameters.autostart
-                && !instance.vm_parameters.no_fs_dependency
                 && !instance.autostart_done
             {
                 error!("autostart enabled for this VM, requested start from pid={} while bootup ongoing, rejecting it.",
@@ -553,32 +1281,94 @@ impl IVirtualMachine for VirtualMachine {
             }
 
             // Check for unsupported restart request
-            if !instance.vm_parameters.vm_ssr_enable {
+            if !instance.vm_parameters.vm_restart_enable {
                 if instance.vm_state == VirtualMachineState::VM_CRASHED || instance.vm_state == VirtualMachineState::STOPPED {
                     error!(
-                        "Request received from pid={} to start a Vm which is in STOPPED/CRASHED state, rejecting it.",
+                        "Request received from pid={} to start a Vm which is in STOPPED/CRASHED state with vm_restart_enable disabled, rejecting it.",
                         ThreadState::get_calling_pid()
                     );
                     return Err(Status::new_service_specific_error_str(
                         ERROR_VM_START,
-                        Some("Cannot start a Vm which is in STOPPED/CRASHED state.")
+                        Some("Cannot start a Vm which is in STOPPED/CRASHED state because vm_restart_enable is disabled.")
                     ));
                 }
             }
 
-            // Launch it!
+            // Launch it! This block is to allow the VM to be spawned.
             match instance.launch_vm() {
-                Ok(_) => return Ok(()),
+                Ok(1) => {
+                    info!("VM Already launched. Status of VM is {:?}",instance.vm_state);
+                    vm_launch_result = 1;
+                    vm_launch_result_response = ("VM launched Successfully").to_string();
+                }
+                Ok(_) => {
+                    instance.vm_state = VirtualMachineState::RUNNING;
+                    instance.set_vm_status_property("RUNNING");
+                    info!("VM launch was succesful. Status of VM is {:?}",instance.vm_state);
+                    vm_launch_result = 0;
+                    vm_launch_result_response = ("VM launched Successfully").to_string();
+                },
                 Err(response) => {
                     error!(
                         "start: {} launch failed with reason: {response}",
                         instance.vm_parameters.name
                     );
-                    return Err(Status::new_service_specific_error_str(
-                        ERROR_VM_START,
-                        Some(response.to_string()),
-                    ));
+                    vm_launch_result = ERROR_VM_START;
+                    vm_launch_result_response = response.to_string();
                 }
+            }
+            //This block is for handling the communication between qvirtservice and the VM
+            if vm_launch_result == 0 {
+                if instance.vm_parameters.vm_ssr_enable {
+                    if instance.vm_state == VirtualMachineState::RUNNING {
+                        instance.set_vendor_vm_info();
+                        match instance.connect_vendorvm(){
+                            Ok(_) => {
+                                info!("VM Connection is set and we have connected to userspace");
+                                //Initiate the connection to the vendor VM and connect with the QTVM
+                                instance.vm_state = VirtualMachineState::VM_USERSPACE_READY;
+                                instance.set_vm_status_property("VM_USERSPACE_READY");
+                            },
+                            Err(response) => {
+                                //VM communication failed so cleaning up VM resources and setting VM status to crashed
+                                error!(
+                                    "Client: {} has been removed: {response}",
+                                    instance.vm_parameters.name
+                                );
+                                if instance.childpid != None{
+                                    match kill(instance.childpid.unwrap(),Signal::SIGKILL){
+                                        Ok(_) => {
+                                            info!("Killing vm Instance and Setting Crashed state");
+                                        },
+                                        Err(e) => {
+                                            error!("{}", format!("Error Killing VM instance {}",e));
+                                        }
+                                    }
+                                }
+                                instance.vm_state = VirtualMachineState::VM_CRASHED;
+                                instance.set_vm_status_property("VM_CRASHED");
+                                return Err(Status::new_service_specific_error_str(
+                                    ERROR_VM_START,
+                                    Some(response.to_string()),
+                                ));
+                            }
+                        }
+                        if instance.vm_parameters.vm_autoshutdown_enable {
+                            // Start auto the shutdown thread
+                            drop(instance);
+                            let vm_instance_clone = self.vm_instance.clone();
+                            VmInstance::auto_shutdown_thread_handle_initiator(vm_instance_clone);
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            else{
+                //If there is any issue in the VM ssr functionality it would fail
+                return Err(Status::new_service_specific_error_str(
+                        ERROR_VM_START,
+                        Some(vm_launch_result_response.to_string()),
+                    ));
             }
         }
         // Strange case, mutex poisoned.
@@ -589,12 +1379,139 @@ impl IVirtualMachine for VirtualMachine {
     }
 
     fn unregister(&self) -> Result<(), Status> {
-        // TODO: add logic to unregister the VM
-        Ok(())
+        //Cleanup of vm resources
+        if let Ok(mut instance) = self.vm_instance.lock() {
+            if instance.vm_parameters.total_votes == 0 {
+                match instance.vm_client_unregister() {
+                    Ok(_) => return Ok(()),
+                    Err(response) => {
+                        error!(
+                            "Client: {} has been removed: {response}",
+                            instance.vm_parameters.name
+                        );
+                        return Err(Status::new_service_specific_error_str(
+                            ERROR_VM_START,
+                            Some(response.to_string()),
+                        ));
+                    }
+                }
+            }
+            else{
+                error!("Current VM state is {:?} and no client is connected to the HAL",instance.vm_state);
+                return Err(Status::new_service_specific_error_str(
+                            ERROR_VM_START,
+                            Some("No Clients are connected. Please initiate the connection".to_string()),
+                        ));
+
+            }
+        }
+        // Strange case, mutex poisoned.
+        return Err(Status::new_exception_str(
+            ExceptionCode::SERVICE_SPECIFIC,
+            Some("Internal Error"),
+        ));
     }
+    //force shutdown on unvote call
+    // fn performtask_client(&self, _task: VirtualMachineClientTask) -> Result<(), Status> {
+    //     if let Ok(instance) = self.vm_instance.lock() {
+    //         if instance.vm_parameters.vm_ssr_enable {
+    //             if instance.vm_state == VirtualMachineState::VM_USERSPACE_READY {
+    //                 if _task == VirtualMachineClientTask::UNVOTE {
+    //                     info!("Starting shutdown timer for VM: {}", instance.vm_parameters.name);
+    //                     drop(instance);
+    //                     let vm_instance_clone = self.vm_instance.clone();
+    //                     VmInstance::auto_shutdown_thread_handle_initiator(vm_instance_clone);
+    //                 }
+    //             } else {
+    //                 info!("VM state not ready for task. Please call start again");
+    //                 return Err(Status::new_exception_str(
+    //                     ExceptionCode::SERVICE_SPECIFIC,
+    //                     Some("VM state not supported to do Perform task. Please call start again"),
+    //                 ));
+    //             }
+    //             return Ok(());
+    //         } else {
+    //             info!("VM voting/unvoting feature is disabled");
+    //             return Err(Status::new_exception_str(
+    //                 ExceptionCode::SERVICE_SPECIFIC,
+    //                 Some("Feature is disabled"),
+    //             ));
+    //         }
+    //     }
+
+    //     return Err(Status::new_exception_str(
+    //         ExceptionCode::SERVICE_SPECIFIC,
+    //         Some("Internal Error"),
+    //     ));
+    // }
 
     fn performtask_client(&self, _task: VirtualMachineClientTask) -> Result<(), Status> {
-        // TODO: handle the client task
-        Ok(())
+        if let Ok(mut instance) = self.vm_instance.lock() {
+            if instance.vm_parameters.vm_ssr_enable {
+                if instance.vm_state == VirtualMachineState::VM_USERSPACE_READY {
+                    if _task == VirtualMachineClientTask::VOTE {
+                        info!("VM client has been voted");
+                        instance.vm_parameters.total_votes += 1;
+                        if let Some(idx) = instance.vm_clients
+                        .iter()
+                        .position(|client_info| client_info.pid == ThreadState::get_calling_pid() && client_info.uid == ThreadState::get_calling_uid())
+                        {
+                            debug!("Voting for the client is happening in VM {} for the following id: {}, pid: {}, uid: {}",
+                            instance.vm_parameters.name,instance.vm_clients[idx].death_id,instance.vm_clients[idx].pid,instance.vm_clients[idx].uid);
+                            instance.vm_clients[idx].client_vote_count += 1;
+                        }
+                    }
+                    else if _task == VirtualMachineClientTask::UNVOTE {
+                        if instance.vm_parameters.total_votes > 0 {
+                            info!("VM client has been unvoted");
+                            instance.vm_parameters.total_votes -= 1;
+                            if let Some(idx) = instance.vm_clients
+                            .iter()
+                            .position(|client_info| client_info.pid == ThreadState::get_calling_pid() && client_info.uid == ThreadState::get_calling_uid())
+                            {
+                                debug!("Unvoting for the client is happening in VM {} for the following id: {}, pid: {}, uid: {}",
+                                instance.vm_parameters.name,instance.vm_clients[idx].death_id,instance.vm_clients[idx].pid,instance.vm_clients[idx].uid);
+                                instance.vm_clients[idx].client_vote_count -= 1;
+                            }
+                            if instance.vm_parameters.total_votes == 0{
+                                if let Some(idx) = instance.vm_clients
+                                .iter()
+                                .position(|client_info| client_info.pid == ThreadState::get_calling_pid() && client_info.uid == ThreadState::get_calling_uid())
+                                {
+                                    if instance.vm_clients[idx].client_vote_count != 0 {
+                                        error!("Client has not unvoted  while Total vote count has reduced{} for the following id: {}, pid: {}, uid: {}",
+                                        instance.vm_parameters.name,instance.vm_clients[idx].death_id,instance.vm_clients[idx].pid,instance.vm_clients[idx].uid);
+                                    }
+                                }
+                                info!("We need to start the shutdown timer");
+                                drop(instance);
+                                let vm_instance_clone = self.vm_instance.clone();
+                                VmInstance::auto_shutdown_thread_handle_initiator(vm_instance_clone);
+                            }
+                        }
+                        else if instance.vm_parameters.total_votes == 0{
+                            info!("No Clients to Unvote");
+                        }
+                    }
+                }
+                else{
+                    info!("Please do a start again and have the connection with the VM established");
+                    return Err(Status::new_exception_str(
+                    ExceptionCode::SERVICE_SPECIFIC,
+                    Some("VM state not supported to do Perform task. Please call start again"),));
+                }
+                return Ok(());
+            }
+            else{
+                info!("VM voting unvoting feature is disabled");
+                return Err(Status::new_exception_str(
+                ExceptionCode::SERVICE_SPECIFIC,
+                Some("Feature is disabled"),));
+            }
+        }
+        return Err(Status::new_exception_str(
+            ExceptionCode::SERVICE_SPECIFIC,
+            Some("Internal Error"),
+        ));
     }
 }
