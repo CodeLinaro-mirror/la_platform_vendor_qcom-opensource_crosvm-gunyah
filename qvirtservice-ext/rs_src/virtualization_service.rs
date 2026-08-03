@@ -76,9 +76,6 @@ impl VirtualizationService {
     pub fn virtualization_service() -> Self {
         let mut vm_instance_map: VmInstanceMap = Default::default();
 
-        // Store the vm's thread handle for the no_fs_dependent ones.
-        let mut no_fs_dependent_handles = Vec::new();
-
         let mut autostart_vms = Vec::<(String, FsDependency)>::new();
 
         // Parse the config file
@@ -136,7 +133,7 @@ impl VirtualizationService {
                 let timeout_for_thread = wrapper.fs_dependency_timeout.clone();
                 let instance_for_thread = wrapper.instance.clone();
                 if fs_dep.no_fs_dependency {
-                    let handle = thread::spawn(move || {
+                    thread::spawn(move || {
                         let mut vm_ssr_enablecheck:bool = false;
                         let mut vm_autostart_done:bool = false;
                         let mut vm_autoshutdown_enablecheck:bool = false;
@@ -169,7 +166,6 @@ impl VirtualizationService {
                             VmInstance::auto_shutdown_thread_handle_initiator(vm_instance);
                         }
                     });
-                    no_fs_dependent_handles.push(handle);
                 } else {
                     let fs_dep_prop = fs_dep.fs_dependency_prop.clone();
                     //Wait for timeout if fs dependent
@@ -233,11 +229,6 @@ impl VirtualizationService {
             } else {
                 error!("VM '{}' not found in instance map, skipping autostart", name);
             }
-        }
-
-        // Join the no_fs_dependent threads
-        for handle in no_fs_dependent_handles {
-            let _res = handle.join();
         }
 
         return service;
