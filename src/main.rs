@@ -34,6 +34,8 @@ use vm_memory::{GuestAddress, GuestMemory, GuestMemoryError, MemoryRegion};
 use std::sync::Arc;
 use std::convert::TryInto;
 
+use devices::virtio::vhost::vsock::Vsock;
+use devices::virtio::vsock::VsockConfig;
 use devices::virtio::block::block::DiskOption;
 use devices::BusAccessInfo;
 use crate::{
@@ -56,6 +58,7 @@ static GH_PATH: &str = "/dev/gunyah";
 static QGH_PATH: &str = "/dev/qgunyah";
 static VIRTIO_BE_PATH: &str = "/dev/gh_virtio_backend_";
 static TRACE_MARKER: &str = "/sys/kernel/tracing/trace_marker";
+static VHOST_VSOCK_PATH: &str = "/dev/vhost-vsock";
 // Todo: Use UAPI header files
 const ASSIGN_EVENTFD: u32 = 1;
 const GH_IOCTL_TYPE_V2: u32 = 0xB2;
@@ -90,6 +93,9 @@ const GH_VCPU_MAX: u16 = 512;
 const CROSVM_MINIJAIL_POLICY: &str = "/system_ext/etc/seccomp_policy/qcrosvm.policy";
 const LOG_TAG: &str = "qcrosvm";
 
+const VHOST_VSOCK_HOST_CID: u64 = 2;
+
+
 #[derive(Debug)]
 
 enum BackendError {
@@ -121,6 +127,15 @@ struct Vcpu {
 	thread_handle: Option<JoinHandle<()>>,
 }
 
+struct VsockDevice {
+    enable: bool,
+    config: VsockConfig,
+    label: u32,
+    mmio: Option<VirtioMmioDevice>,
+    config_space: Option<Vec<u32>>,
+}
+
+
 /// Aggregate of all configurable options for a block device
 struct BackendConfig {
     sfd: Option<SafeDescriptor>,
@@ -128,6 +143,7 @@ struct BackendConfig {
     vm: Option<String>,
     mem: Option<GuestMemory>,
     vdisks: Vec<VirtioDisk>,
+    vsock: VsockDevice,
     vcpus: Vec<Vcpu>,
     vcpu_count: u16,
     driver_variant: u8,
@@ -140,6 +156,16 @@ impl Default for BackendConfig {
     fn default() -> BackendConfig {
         BackendConfig {
             vdisks: Vec::new(),
+            vsock: VsockDevice {
+                enable: false,
+                config: VsockConfig {
+                    cid: 0,
+                    vhost_device: PathBuf::from(VHOST_VSOCK_PATH),
+                },
+                label: 0,
+                mmio: None,
+                config_space: None,
+            },
             vm: None,
             mem: None,
             sfd: None,
@@ -321,7 +347,7 @@ fn to_cmd(ioc: VmIoctl, version: u8) -> std::result::Result<i32, BackendError> {
 }
 
 fn print_usage() {
-    println!("qcrosvm [-l] [-s] [--disk=IMAGE_FILE,label=LABEL[,rw=[true|false],sparse=[true|false],block_size=BYTES]] --vm=VMNAME");
+    println!("qcrosvm [-l] [-s] [--disk=IMAGE_FILE,label=LABEL[,rw=[true|false],sparse=[true|false],block_size=BYTES]] [--vsock=label=LABEL,cid=GUEST_CID] --vm=VMNAME");
     println!("\n[-l] or [--log=[level=trace|debug|info|warn|error],[type=ftrace|logcat|term]]");
     println!("Default logger level: info");
     println!("Default logger type: ftrace");
@@ -415,8 +441,7 @@ fn create_bdev(disk: &DiskOption, q_size: Option<u16>) -> std::result::Result<Bo
     Ok(Box::new(dev))
 }
 
-fn create_block_devices(cfg: &mut BackendConfig) -> std::result::Result<(), BackendError> {
-    let mut irq_num = 0;
+fn create_block_devices(cfg: &mut BackendConfig, irq_num: &mut u32) -> std::result::Result<(), BackendError> {
     for vdisk in &mut cfg.vdisks {
         let mem = cfg.mem.as_ref().expect(&format!("{}:{}", file!(), line!()));
 	let sfd :&SafeDescriptor;
@@ -451,8 +476,8 @@ fn create_block_devices(cfg: &mut BackendConfig) -> std::result::Result<(), Back
         }
 
         let irq_evt = devices::IrqEdgeEvent::new().expect(&format!("{}:{}", file!(), line!()));
-        mmio.assign_irq(&irq_evt, irq_num);
-        irq_num = irq_num + 1;
+        mmio.assign_irq(&irq_evt, *irq_num);
+        *irq_num = *irq_num + 1;
 
         let irq_fd = VirtioIrqfd {
             _label: vdisk.label,
@@ -473,6 +498,71 @@ fn create_block_devices(cfg: &mut BackendConfig) -> std::result::Result<(), Back
     }
 
     Ok(())
+}
+
+fn create_vhost_vsock_device(vsockcfg: &VsockConfig) -> std::result::Result<Box<Vsock>, BackendError> {
+        let features :u64 = base_features(ProtectionType::Protected);
+        let dev = virtio::vhost::vsock::Vsock::new(features, vsockcfg)
+                        .map_err(|_| BackendError::StrError(String::from("vhost vsock new failed")))?;
+        Ok(Box::new(dev))
+}
+
+fn create_vsock_device(cfg: &mut BackendConfig, irq_num: &mut u32) -> std::result::Result<(), BackendError> {
+        let mem = cfg.mem.as_ref().expect(&format!("{}:{}", file!(), line!()));
+        let _vsock = &mut cfg.vsock;
+        let vsockdev = create_vhost_vsock_device(&_vsock.config)?;
+        let sfd :&SafeDescriptor;
+        match cfg.driver_variant {
+                1 => {sfd = cfg.sfd.as_ref().expect(&format!("{}:{}", file!(), line!()));}
+                2 => {sfd = cfg.vm_sfd.as_ref().expect(&format!("{}:{}", file!(), line!()));}
+                _ => return Err(BackendError::StrError(String::from("Unsupported driver variant.")))
+        };
+
+        _vsock.mmio = Some(VirtioMmioDevice::new(mem.clone(), vsockdev, true).expect(&format!("{}:{}", file!(), line!())));
+        let mut idx = 0;
+        let mmio = _vsock.mmio.as_mut().expect(&format!("{}:{}", file!(), line!()));
+        mmio.on_sandboxed();
+        for (e, _addr, _datamatch) in mmio.ioevents() {
+            let event_fd = VirtioEventfd {
+                _label : _vsock.label,
+                _flags : ASSIGN_EVENTFD,
+                _queue_num : idx,
+                _fd : e.as_raw_descriptor(),
+            };
+
+            idx = idx + 1;
+            let ret = unsafe { ioctl_with_ref(sfd, to_cmd(VmIoctl::IoEventFd, cfg.driver_variant)
+                                                       .expect(&format!("{}:{}", file!(), line!())), &event_fd) };
+            if ret < 0 {
+                    return Err(BackendError::StrNumError {
+                    err: String::from("ioeventfd ioctl failed"),
+                    val: io::Error::last_os_error(),
+                });
+            }
+        }
+
+        let irq_evt = devices::IrqEdgeEvent::new().expect(&format!("{}:{}", file!(), line!()));
+        mmio.assign_irq(&irq_evt, *irq_num);
+        *irq_num = *irq_num + 1;
+
+        let irq_fd = VirtioIrqfd {
+            _label: _vsock.label,
+            _fd : irq_evt.as_raw_descriptors().clone().into_iter().nth(0)
+                                                .expect(&format!("{}:{}", file!(), line!())),
+            _flags: VBE_ASSIGN_IRQFD,
+            _reserved: 0,
+        };
+
+        let ret = unsafe { ioctl_with_ref(sfd, to_cmd(VmIoctl::IrqFd, cfg.driver_variant)
+                               .expect(&format!("{}:{}", file!(), line!())), &irq_fd) };
+        if ret < 0 {
+            return Err(BackendError::StrNumError {
+                err: String::from("irqfd ioctl failed"),
+                val: io::Error::last_os_error(),
+            });
+        }
+
+        Ok(())
 }
 
 fn mmio_write(mmio: &mut VirtioMmioDevice, offset: u64, data: u32) {
@@ -523,45 +613,48 @@ fn handle_driver_ok(label: u32, sfd: &SafeDescriptor, mmio: &mut VirtioMmioDevic
 
     mmio_write(mmio, VIRTIO_MMIO_DRIVER_FEATURES, drv_feat._features);
 
-    let mut qinfo = VirtioQueueInfo {
-                _label: label,
-                _queue_sel: 0,
-                _queue_num: 0,
-                _queue_ready: 0,
-                _queue_desc: 0,
-                _queue_driver: 0,
-                _queue_device: 0,
-    };
+    let qsize = mmio.ioevents().len();
+    for queue_index in 0..qsize as u32 {
+        let mut qinfo = VirtioQueueInfo {
+                        _label: label,
+                        _queue_sel: queue_index as u32,
+                        _queue_num: 0,
+                        _queue_ready: 0,
+                        _queue_desc: 0,
+                        _queue_driver: 0,
+                        _queue_device: 0,
+        };
 
-    let mut queue_addr: u32;
+        let mut queue_addr: u32;
 
-    let ret = unsafe { ioctl_with_mut_ref(sfd, to_cmd(VmIoctl::GetQueueInfo, driver_variant)
-	                   .expect(&format!("{}:{}", file!(), line!())), &mut qinfo)};
-    assert!(ret == 0, "{}:{}:ret={}, {}", file!(), line!(), ret, io::Error::last_os_error());
+        let ret = unsafe { ioctl_with_mut_ref(sfd, to_cmd(VmIoctl::GetQueueInfo, driver_variant)
+                               .expect(&format!("{}:{}", file!(), line!())), &mut qinfo)};
+        assert!(ret == 0, "{}:{}:ret={}, {}", file!(), line!(), ret, io::Error::last_os_error());
 
-    mmio_write(mmio, VIRTIO_MMIO_QUEUE_SEL, 0x0u32);
+        mmio_write(mmio, VIRTIO_MMIO_QUEUE_SEL, queue_index as u32);
 
-    mmio_write(mmio, VIRTIO_MMIO_QUEUE_NUM, qinfo._queue_num);
+        mmio_write(mmio, VIRTIO_MMIO_QUEUE_NUM, qinfo._queue_num);
 
-    queue_addr = qinfo._queue_desc as u32;
-    mmio_write(mmio, VIRTIO_MMIO_QUEUE_DESC_LOW, queue_addr);
+        queue_addr = qinfo._queue_desc as u32;
+        mmio_write(mmio, VIRTIO_MMIO_QUEUE_DESC_LOW, queue_addr);
 
-    queue_addr = (qinfo._queue_desc >> 32) as u32;
-    mmio_write(mmio, VIRTIO_MMIO_QUEUE_DESC_HIGH, queue_addr);
+        queue_addr = (qinfo._queue_desc >> 32) as u32;
+        mmio_write(mmio, VIRTIO_MMIO_QUEUE_DESC_HIGH, queue_addr);
 
-    queue_addr = qinfo._queue_driver as u32;
-    mmio_write(mmio, VIRTIO_MMIO_QUEUE_AVAIL_LOW, queue_addr);
+        queue_addr = qinfo._queue_driver as u32;
+        mmio_write(mmio, VIRTIO_MMIO_QUEUE_AVAIL_LOW, queue_addr);
 
-    queue_addr = (qinfo._queue_driver >> 32) as u32;
-    mmio_write(mmio, VIRTIO_MMIO_QUEUE_AVAIL_HIGH, queue_addr);
+        queue_addr = (qinfo._queue_driver >> 32) as u32;
+        mmio_write(mmio, VIRTIO_MMIO_QUEUE_AVAIL_HIGH, queue_addr);
 
-    queue_addr = qinfo._queue_device as u32;
-    mmio_write(mmio, VIRTIO_MMIO_QUEUE_USED_LOW, queue_addr);
+        queue_addr = qinfo._queue_device as u32;
+        mmio_write(mmio, VIRTIO_MMIO_QUEUE_USED_LOW, queue_addr);
 
-    queue_addr = (qinfo._queue_device >> 32) as u32;
-    mmio_write(mmio, VIRTIO_MMIO_QUEUE_USED_HIGH, queue_addr);
+        queue_addr = (qinfo._queue_device >> 32) as u32;
+        mmio_write(mmio, VIRTIO_MMIO_QUEUE_USED_HIGH, queue_addr);
 
-    mmio_write(mmio, VIRTIO_MMIO_QUEUE_READY, qinfo._queue_ready);
+        mmio_write(mmio, VIRTIO_MMIO_QUEUE_READY, qinfo._queue_ready);
+    }
 
     mmio_write(mmio, VIRTIO_MMIO_STATUS, cspace[VIRTIO_MMIO_STATUS_IDX as usize]);
 
@@ -659,17 +752,20 @@ fn init_config_space(config_space: &mut Vec<u32>, label: u32, mmio: &mut VirtioM
 	               .expect(&format!("{}:{}", file!(), line!())), &mut feat) };
 	assert!(ret == 0, "{}:{}:ret={}, {}", file!(), line!(), ret, io::Error::last_os_error());
 
-	let mut queue_max = VirtioQueueMax {
-		_label: label,
-		_reserved: 0,
-		_queue_sel: 0,
-		_queue_num_max: 0,
-	};
+	let qsize = mmio.ioevents().len();
+	for queue_index in 0..qsize as u32 {
+		let mut queue_max = VirtioQueueMax {
+			_label: label,
+			_reserved: 0,
+			_queue_sel: queue_index as u32,
+			_queue_num_max: 0,
+		};
 
-	queue_max._queue_num_max = read_banked_reg(mmio, queue_max._queue_sel, VIRTIO_MMIO_QUEUE_SEL, VIRTIO_MMIO_QUEUE_NUM_MAX);
-	ret = unsafe { ioctl_with_mut_ref(sfd, to_cmd(VmIoctl::SetQueueNumMax, driver_variant)
-	               .expect(&format!("{}:{}", file!(), line!())), &mut queue_max) };
-	assert!(ret == 0, "{}:{}:ret={}, {}", file!(), line!(), ret, io::Error::last_os_error());
+		queue_max._queue_num_max = read_banked_reg(mmio, queue_max._queue_sel, VIRTIO_MMIO_QUEUE_SEL, VIRTIO_MMIO_QUEUE_NUM_MAX);
+		ret = unsafe { ioctl_with_mut_ref(sfd, to_cmd(VmIoctl::SetQueueNumMax, driver_variant)
+			.expect(&format!("{}:{}", file!(), line!())), &mut queue_max) };
+		assert!(ret == 0, "{}:{}:ret={}, {}", file!(), line!(), ret, io::Error::last_os_error());
+	}
 }
 
 fn set_minijail(policy: &str) -> Result<(), ()> {
@@ -777,8 +873,7 @@ fn run_backend_v2(cfg: &mut BackendConfig, file_name: String) -> std::result::Re
 	cfg.vcpu_count = vcpu_count as u16;
 	info!("{}", format!("vcpu_count {}", cfg.vcpu_count));
 
-	let mut blk_thread_handles  = Vec::new();
-	if !cfg.vdisks.is_empty() {
+	if !cfg.vdisks.is_empty() || cfg.vsock.enable {
 		let mut shmem_size: u64 = 0;
 		let ret = unsafe { ioctl_with_mut_ref(vm_sfd, GET_SHARED_MEMORY_SIZE_V2(), &mut shmem_size) };
 		if ret != 0 || shmem_size == 0 {
@@ -790,8 +885,12 @@ fn run_backend_v2(cfg: &mut BackendConfig, file_name: String) -> std::result::Re
 
 		cfg.mem = Some(self::new_from_rawfd(&[(GuestAddress(0), shmem_size)], &vm_fd)
 		               .expect(&format!("{}:{}", file!(), line!())));
+	}
 
-		let e = create_block_devices(cfg);
+	let mut irq_num = 0;
+	let mut blk_thread_handles  = Vec::new();
+	if !cfg.vdisks.is_empty() {
+		let e = create_block_devices(cfg, &mut irq_num);
 		if let Err(_e) = e {
 			error!("{}", _e);
 			panic!("{}", _e);
@@ -814,6 +913,30 @@ fn run_backend_v2(cfg: &mut BackendConfig, file_name: String) -> std::result::Re
 		}
 	}
 
+	let mut vsock_thread_handles = Vec::new();
+	if cfg.vsock.enable {
+		let vsock_err = create_vsock_device(cfg, &mut irq_num);
+
+		if let Err(_vsock_err) = vsock_err {
+			error!("{}", _vsock_err);
+			return Err(());
+		}
+
+		let label = cfg.vsock.label;
+		let mut sfd = cfg.vm_sfd.as_mut().expect(&format!("{}:{}", file!(), line!())).try_clone()
+			      .expect(&format!("{}:{}", file!(), line!()));
+		let mut mmio = cfg.vsock.mmio.take().unwrap();
+		let mut cspace = cfg.vsock.config_space.take().unwrap();
+		let driver_variant = cfg.driver_variant;
+		init_config_space(&mut cspace, label, &mut mmio, &mut sfd, driver_variant);
+
+		debug!("Vsock Thread being created");
+		let handle = thread::spawn(move || {
+				handle_events(label, sfd, &mut mmio, &mut cspace, driver_variant);
+				});
+		vsock_thread_handles.push(handle);
+	}
+
 	let e = create_vcpus(cfg);
 	if let Err(_e) = e {
 		error!("{}", _e);
@@ -833,6 +956,12 @@ fn run_backend_v2(cfg: &mut BackendConfig, file_name: String) -> std::result::Re
 			let _ret = handle.join();
 		}
 	}
+	if cfg.vsock.enable {
+		for handle in vsock_thread_handles {
+			let _ret = handle.join();
+		}
+	}
+
 	Ok(())
 }
 
@@ -868,7 +997,8 @@ fn run_backend_v1(cfg: &mut BackendConfig) -> std::result::Result<(), ()>
 	cfg.mem = Some(self::new_from_rawfd(&[(GuestAddress(0), shmem_size)], &sfd.as_raw_descriptor())
 	               .expect(&format!("{}:{}", file!(), line!())));
 
-	let e = create_block_devices(cfg);
+	let mut irq_num = 0;
+	let e = create_block_devices(cfg, &mut irq_num);
 	if let Err(_e) = e {
 		error!("{}", _e);
 		panic!("{}", _e);
@@ -1143,6 +1273,75 @@ fn set_argument(cfg: &mut BackendConfig, name: &str, value: Option<&str>) -> arg
 		cfg.vdisks.push(vdisk);
 	}
 
+	"vsock" => {
+		let param = value.expect(&format!("{}:{}", file!(), line!()));
+		let components = param.split(',');
+		let mut vsock_label: u32 = 0;
+		let mut vsock_cid: u64 = 0;
+		let vsock_path = PathBuf::from(VHOST_VSOCK_PATH);
+
+		for opt in components {
+			let mut o = opt.splitn(2, '=');
+			let kind = o.next().ok_or_else(|| argument::Error::InvalidValue {
+				value: opt.to_owned(),
+				expected: String::from("vsock options must not be empty"),
+			})?;
+
+			let value = o.next().ok_or_else(|| argument::Error::InvalidValue {
+					value: opt.to_owned(),
+					expected: String::from("vsock options must be of the form `kind=value`"),
+				})?;
+
+			match kind {
+				"label" => {
+					let label: u32 = u32::from_str_radix(value, 16)
+						.map_err(|_| argument::Error::InvalidValue {
+							value: value.to_owned(),
+							expected: String::from("`label` must be an unsigned integer"),
+					})?;
+					if label == 0 {
+						return Err(argument::Error::InvalidValue {
+							value: value.to_owned(),
+							expected: String::from("`label` must be a non zero integer"),
+						});
+					}
+					vsock_label = label;
+				}
+
+				"cid" => {
+					let cid = value.parse().map_err(|_| argument::Error::InvalidValue {
+						value: value.to_owned(),
+						expected: String::from("cid must be an unsigned integer"),
+					})?;
+
+					if cid ==  VHOST_VSOCK_HOST_CID {
+						return Err(argument::Error::InvalidValue {
+							value: value.to_owned(),
+							expected: String::from("guest cid cannot equal host cid"),
+						});
+					}
+					vsock_cid = cid;
+				}
+
+				_ => {
+					return Err(argument::Error::InvalidValue {
+						value: kind.to_owned(),
+						expected: String::from("supported vsock options only"),
+					});
+				}
+			}
+		}
+		cfg.vsock = VsockDevice {
+			enable: true,
+			config: VsockConfig {
+				cid: vsock_cid,
+				vhost_device: vsock_path,
+			},
+			label: vsock_label,
+			mmio: None,
+			config_space: Some(Vec::new()),
+		};
+	}
 	"vm" => {
 		cfg.vm = Some(value.expect(&format!("{}:{}", file!(), line!())).to_owned());
 		//PID would be required for log analysis of all log levels. Hence error!().
@@ -1236,6 +1435,9 @@ fn parse_and_run(args: std::env::Args) -> std::result::Result<(), ()> {
 			"Logging Configurations. Default level: info, Default type: ftrace"),
 			Argument::short_value('v', "vm", "VMNAME", "Virtual Machine Name"),
 			Argument::short_flag('s', "sandbox", "Sandbox using minijail (default: disabled."),
+			Argument::value("vsock", "label=LABEL,cid=GUEST_CID",
+			"label=LABEL - Indicates the label associated with vsock
+			cid=GUEST_CID - Indicates the cid of guest VM"),
 		];
 
 	let mut cfg = BackendConfig::default();
